@@ -1,0 +1,24 @@
+[package]
+name = "ssher"
+version = "0.1.0"
+edition = "2021"
+authors = ["SSH Manager Contributors"]
+description = "A Linux CLI application to manage and launch SSH connections to saved servers"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+keyring = "2.1"
+dirs = "5.0"
+anyhow = "1.0"
+thiserror = "1.0"
+rpassword = "7.2"
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["events"] }
+figlet-rs = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
