@@ -3,7 +3,7 @@ use crate::models::{AuthMethod, Server};
 use crate::ssh::Ssh;
 use crate::storage::Storage;
 use crate::terminal::Terminal;
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;

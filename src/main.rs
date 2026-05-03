@@ -19,7 +19,7 @@ use terminal::Terminal;
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
@@ -66,9 +66,6 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-
-    /// Interactive TUI mode
-    Interactive,
 }
 
 #[derive(Subcommand)]
@@ -81,23 +78,29 @@ enum ConfigAction {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // If no arguments provided, launch interactive TUI
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() == 1 {
+        // No arguments, launch TUI
+        let mut ui = tui::Tui::new();
+        if let Err(e) = ui.run() {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    } else {
+        // Parse CLI arguments
+        let cli = Cli::parse();
 
-    if let Err(e) = run(cli) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+        if let Err(e) = run(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // If no command specified, launch interactive TUI
-    let command = cli.command.unwrap_or(Commands::Interactive);
-
-    match command {
-        Commands::Interactive => {
-            let mut ui = tui::Tui::new();
-            ui.run()
-        }
+    match cli.command {
         Commands::Add {
             name,
             host,
