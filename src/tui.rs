@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal as RattuiTerminal;
 use std::io::{self, Write};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MenuItem {
@@ -28,6 +29,7 @@ enum MenuItem {
 pub struct Tui {
     current_menu: MenuItem,
     menu_items: Vec<MenuItem>,
+    needs_redraw: bool,
 }
 
 impl Tui {
@@ -42,6 +44,7 @@ impl Tui {
                 MenuItem::Config,
                 MenuItem::Exit,
             ],
+            needs_redraw: true,
         }
     }
 
@@ -71,24 +74,31 @@ impl Tui {
 
     fn main_loop(&mut self, terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
-            terminal.draw(|f| {
-                self.draw(f);
-            })?;
-
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => self.previous(),
-                    KeyCode::Down | KeyCode::Char('j') => self.next(),
-                    KeyCode::Enter => {
-                        if self.current_menu == MenuItem::Exit {
-                            break;
+            if event::poll(Duration::from_millis(33))? {
+                match event::read()? {
+                    Event::Key(key) => match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                        KeyCode::Down | KeyCode::Char('j') => self.next(),
+                        KeyCode::Enter => {
+                            if self.current_menu == MenuItem::Exit {
+                                break;
+                            }
+                            self.handle_selection()?;
                         }
-                        self.handle_selection()?;
+                        KeyCode::Esc | KeyCode::Char('q') => break,
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => {
+                        self.needs_redraw = true;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => break,
                     _ => {}
                 }
             }
+
+            terminal.draw(|f| {
+                self.draw(f);
+            })?;
+            self.needs_redraw = false;
         }
 
         Ok(())
@@ -215,6 +225,7 @@ impl Tui {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
         io::stdout().flush()?;
+        self.needs_redraw = true;
 
         Ok(())
     }
