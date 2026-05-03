@@ -5,7 +5,8 @@ use crate::storage::Storage;
 use crate::terminal::Terminal;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType};
+use crossterm::cursor::{Hide, Show, MoveTo};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -48,7 +49,7 @@ impl Tui {
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = RattuiTerminal::new(backend)?;
 
@@ -59,7 +60,9 @@ impl Tui {
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
-            LeaveAlternateScreen
+            Clear(ClearType::All),
+            LeaveAlternateScreen,
+            Show
         )?;
         terminal.show_cursor()?;
 
@@ -191,9 +194,10 @@ impl Tui {
         self.current_menu = self.menu_items[(idx + self.menu_items.len() - 1) % self.menu_items.len()];
     }
 
-    fn handle_selection(&self) -> Result<()> {
+    fn handle_selection(&mut self) -> Result<()> {
+        // Clear and hide UI before leaving
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Clear(ClearType::All), LeaveAlternateScreen, Show)?;
 
         match self.current_menu {
             MenuItem::List => self.show_list(),
@@ -209,7 +213,8 @@ impl Tui {
         io::stdin().read_line(&mut input)?;
 
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+        io::stdout().flush()?;
 
         Ok(())
     }
