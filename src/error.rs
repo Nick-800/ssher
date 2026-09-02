@@ -52,7 +52,11 @@ pub enum SshManagerError {
     PasswordNotInKeyring(String),
 
     #[error("sshpass is not installed. Install it to use password authentication")]
+    #[allow(dead_code)]
     SshpassNotInstalled,
+
+    #[error("Failed to set up SSH_ASKPASS helper: {0}")]
+    AskspassSetupFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;

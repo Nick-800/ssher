@@ -17,7 +17,10 @@ thiserror = "1.0"
 rpassword = "7.2"
 ratatui = "0.26"
 crossterm = { version = "0.27", features = ["events"] }
-figlet-rs = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

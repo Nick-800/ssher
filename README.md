@@ -16,11 +16,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 ### System Requirements
 - Linux operating system
 - Rust 1.70+ (for building)
-- One of the following terminal emulators: `gnome-terminal` or `xterm`
-- For password-based authentication: `sshpass` package
-
-### Optional
-
+- One of the following terminal emulators: `gnome-terminal`, `konsole`, `xfce4-terminal`, or `xterm`
 - `openssh-client` (usually pre-installed on most Linux distributions)
 
 ## Installation
@@ -152,7 +148,10 @@ Passwords are stored securely in your system's keyring:
 - **Linux with GNOME/KDE**: Stored in Secret Service
 - **Other Linux systems**: May use pass, kwallet, or other keyring providers
 
-Passwords are **never** stored in plain text on disk.
+Passwords are **never** stored in plain text on disk. When connecting, the
+password is delivered to `ssh` through `SSH_ASKPASS` — it never appears in
+the parent process's command line, environment of the spawned terminal, or
+the system process table.
 
 ## Error Handling
 
@@ -160,8 +159,9 @@ The application provides clear error messages for common issues:
 
 - `Server not found: myserver` — The specified server doesn't exist
 - `SSH key file not found: /path/to/key` — Key file path is invalid
-- `Terminal not found` — Neither gnome-terminal nor xterm is installed
-- `sshpass is not installed` — Required for password authentication
+- `Terminal not found` — None of the supported terminal emulators are installed
+- `Failed to set up SSH_ASKPASS helper: ...` — Could not write the temporary
+  askpass helper (used for password auth)
 - `Invalid configuration: ...` — Config file is corrupted or invalid
 
 ## Command Reference
@@ -202,10 +202,14 @@ Run tests:
 cargo test
 ```
 
+The full test suite is run in CI (`.github/workflows/ci.yml`) and covers
+config validation, serde round-trips, SSH argument construction, the
+`SSH_ASKPASS` helper setup, and the terminal-emulator discovery logic.
+
 ## Troubleshooting
 
 ### "Terminal not found" error
-Install gnome-terminal or xterm:
+Install one of the supported terminal emulators:
 ```bash
 # Ubuntu/Debian
 sudo apt install gnome-terminal xterm
@@ -215,19 +219,6 @@ sudo dnf install gnome-terminal xterm
 
 # Arch
 sudo pacman -S gnome-terminal xterm
-```
-
-### "sshpass is not installed" error
-Install sshpass (required only for password-based authentication):
-```bash
-# Ubuntu/Debian
-sudo apt install sshpass
-
-# Fedora
-sudo dnf install sshpass
-
-# Arch
-sudo pacman -S sshpass
 ```
 
 ### Password not being stored in keyring

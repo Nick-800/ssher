@@ -3,10 +3,12 @@ use crate::models::{AuthMethod, Server};
 use crate::ssh::Ssh;
 use crate::storage::Storage;
 use crate::terminal::Terminal;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType};
-use crossterm::cursor::{Hide, Show, MoveTo};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -52,7 +54,13 @@ impl Tui {
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Hide,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = RattuiTerminal::new(backend)?;
 
@@ -72,9 +80,14 @@ impl Tui {
         result
     }
 
-    fn main_loop(&mut self, terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    fn main_loop(
+        &mut self,
+        terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         loop {
+            let mut had_event = false;
             if event::poll(Duration::from_millis(33))? {
+                had_event = true;
                 match event::read()? {
                     Event::Key(key) => match key.code {
                         KeyCode::Up | KeyCode::Char('k') => self.previous(),
@@ -95,10 +108,13 @@ impl Tui {
                 }
             }
 
-            terminal.draw(|f| {
-                self.draw(f);
-            })?;
-            self.needs_redraw = false;
+            // Only redraw when something changed. Idle ticks no longer burn CPU.
+            if had_event || self.needs_redraw {
+                terminal.draw(|f| {
+                    self.draw(f);
+                })?;
+                self.needs_redraw = false;
+            }
         }
 
         Ok(())
@@ -118,7 +134,11 @@ impl Tui {
         // Draw banner
         let banner = Self::get_banner();
         let banner_widget = Paragraph::new(banner)
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
             .alignment(Alignment::Center);
         f.render_widget(banner_widget, chunks[0]);
 
@@ -129,11 +149,13 @@ impl Tui {
             .map(|item| {
                 let label = self.get_menu_label(*item);
                 if *item == self.current_menu {
-                    ListItem::new(format!("▶ {}", label))
-                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    ListItem::new(format!("▶ {}", label)).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    ListItem::new(format!("  {}", label))
-                        .style(Style::default().fg(Color::White))
+                    ListItem::new(format!("  {}", label)).style(Style::default().fg(Color::White))
                 }
             })
             .collect();
@@ -145,16 +167,29 @@ impl Tui {
         f.render_widget(menu_list, chunks[1]);
 
         // Draw instructions
-        let instructions = vec![
-            Line::from(vec![
-                Span::styled("↑/↓ or j/k", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(" to navigate • "),
-                Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(" to select • "),
-                Span::styled("q/Esc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(" to quit"),
-            ]),
-        ];
+        let instructions = vec![Line::from(vec![
+            Span::styled(
+                "↑/↓ or j/k",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to navigate • "),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to select • "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to quit"),
+        ])];
 
         let instructions_widget = Paragraph::new(instructions)
             .block(Block::default().borders(Borders::ALL))
@@ -164,7 +199,7 @@ impl Tui {
     }
 
     fn get_banner() -> String {
-        let lines = vec![
+        let lines = [
             "  ███████╗███████╗██╗  ██╗███████╗██████╗ ",
             "  ██╔════╝██╔════╝██║  ██║██╔════╝██╔══██╗",
             "  ███████╗███████╗███████║█████╗  ██████╔╝",
@@ -201,13 +236,19 @@ impl Tui {
             .iter()
             .position(|&m| m == self.current_menu)
             .unwrap_or(0);
-        self.current_menu = self.menu_items[(idx + self.menu_items.len() - 1) % self.menu_items.len()];
+        self.current_menu =
+            self.menu_items[(idx + self.menu_items.len() - 1) % self.menu_items.len()];
     }
 
     fn handle_selection(&mut self) -> Result<()> {
         // Clear and hide UI before leaving
         disable_raw_mode()?;
-        execute!(io::stdout(), Clear(ClearType::All), LeaveAlternateScreen, Show)?;
+        execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            LeaveAlternateScreen,
+            Show
+        )?;
 
         match self.current_menu {
             MenuItem::List => self.show_list(),
@@ -223,7 +264,13 @@ impl Tui {
         io::stdin().read_line(&mut input)?;
 
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            Hide,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
         io::stdout().flush()?;
         self.needs_redraw = true;
 

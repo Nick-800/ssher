@@ -80,7 +80,7 @@ enum ConfigAction {
 fn main() {
     // If no arguments provided, launch interactive TUI
     let args: Vec<String> = std::env::args().collect();
-    
+
     if args.len() == 1 {
         // No arguments, launch TUI
         let mut ui = tui::Tui::new();
@@ -109,9 +109,7 @@ fn run(cli: Cli) -> Result<()> {
             key,
             password,
             agent_forwarding,
-        } => {
-            add_server(name, host, username, port, key, password, agent_forwarding)
-        }
+        } => add_server(name, host, username, port, key, password, agent_forwarding),
         Commands::List => list_servers(),
         Commands::Connect { name } => connect_server(&name),
         Commands::Remove { name } => remove_server(&name),
@@ -196,7 +194,10 @@ fn list_servers() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}", "Name", "Host", "Username", "Port", "Auth", "Agent FW");
+    println!(
+        "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
+        "Name", "Host", "Username", "Port", "Auth", "Agent FW"
+    );
     println!("{}", "─".repeat(95));
 
     for server in &config.servers {
@@ -204,7 +205,11 @@ fn list_servers() -> Result<()> {
             AuthMethod::Key => "key",
             AuthMethod::Password => "password",
         };
-        let agent_fw = if server.use_agent_forwarding { "yes" } else { "no" };
+        let agent_fw = if server.use_agent_forwarding {
+            "yes"
+        } else {
+            "no"
+        };
 
         println!(
             "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
@@ -252,7 +257,7 @@ fn remove_server(name: &str) -> Result<()> {
 
 fn set_terminal_config(terminal_name: &str) -> Result<()> {
     // Validate that terminal exists
-    if !Terminal::get_terminal_command(Some(terminal_name)).is_ok() {
+    if Terminal::get_terminal_command(Some(terminal_name)).is_err() {
         return Err(error::SshManagerError::TerminalNotFound);
     }
 
