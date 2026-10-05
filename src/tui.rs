@@ -96,7 +96,7 @@ impl Tui {
                             if self.current_menu == MenuItem::Exit {
                                 break;
                             }
-                            self.handle_selection()?;
+                            self.handle_selection(terminal)?;
                         }
                         KeyCode::Esc | KeyCode::Char('q') => break,
                         _ => {}
@@ -240,11 +240,14 @@ impl Tui {
             self.menu_items[(idx + self.menu_items.len() - 1) % self.menu_items.len()];
     }
 
-    fn handle_selection(&mut self) -> Result<()> {
+    fn handle_selection(
+        &mut self,
+        terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         // Clear and hide UI before leaving
         disable_raw_mode()?;
         execute!(
-            io::stdout(),
+            terminal.backend_mut(),
             Clear(ClearType::All),
             LeaveAlternateScreen,
             Show
@@ -264,14 +267,8 @@ impl Tui {
         io::stdin().read_line(&mut input)?;
 
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            Hide,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
-        io::stdout().flush()?;
+        execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+        terminal.clear()?;
         self.needs_redraw = true;
 
         Ok(())
@@ -508,7 +505,7 @@ impl Tui {
         io::stdin().read_line(&mut choice)?;
 
         if choice.trim() == "1" {
-            print!("\nTerminal name (gnome-terminal, xterm, etc.): ");
+            print!("\nTerminal name (current, gnome-terminal, xterm, etc.): ");
             io::stdout().flush()?;
             let mut terminal = String::new();
             io::stdin().read_line(&mut terminal)?;

@@ -53,6 +53,9 @@ enum Commands {
     Connect {
         /// Server name to connect to
         name: String,
+        /// Connect directly in current terminal instead of spawning an external window
+        #[arg(short, long)]
+        current: bool,
     },
 
     /// Remove a saved SSH server
@@ -111,7 +114,7 @@ fn run(cli: Cli) -> Result<()> {
             agent_forwarding,
         } => add_server(name, host, username, port, key, password, agent_forwarding),
         Commands::List => list_servers(),
-        Commands::Connect { name } => connect_server(&name),
+        Commands::Connect { name, current } => connect_server(&name, current),
         Commands::Remove { name } => remove_server(&name),
         Commands::Config {
             action: ConfigAction::Terminal { name },
@@ -220,7 +223,7 @@ fn list_servers() -> Result<()> {
     Ok(())
 }
 
-fn connect_server(name: &str) -> Result<()> {
+fn connect_server(name: &str, force_current: bool) -> Result<()> {
     let config = Storage::load_config()?;
 
     let server = config
@@ -228,7 +231,11 @@ fn connect_server(name: &str) -> Result<()> {
         .ok_or_else(|| error::SshManagerError::ServerNotFound(name.to_string()))?;
 
     // Get terminal to use
-    let terminal_name = Terminal::get_terminal_command(config.preferred_terminal.as_deref())?;
+    let terminal_name = if force_current {
+        "current".to_string()
+    } else {
+        Terminal::get_terminal_command(config.preferred_terminal.as_deref())?
+    };
 
     println!("Connecting to {}...", name);
     Ssh::launch_connection(server, &terminal_name)?;

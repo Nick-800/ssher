@@ -36,6 +36,24 @@ impl Ssh {
         args
     }
 
+    /// Build the full argv for spawning `ssh`, with `"ssh"` as argv[0].
+    pub fn build_ssh_argv(server: &Server) -> Vec<String> {
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(Self::build_ssh_args(server));
+        argv
+    }
+
+    /// Normalize uncommon local TERM values (e.g. `xterm-kitty`, `alacritty`)
+    /// to `xterm-256color` so remote servers lacking specialized terminfo databases
+    /// do not produce "unknown terminal type" errors.
+    pub fn normalize_term(term: &str) -> Option<&'static str> {
+        if term.contains("kitty") || term == "alacritty" {
+            Some("xterm-256color")
+        } else {
+            None
+        }
+    }
+
     /// Store password in OS keyring
     pub fn store_password(server_name: &str, password: &str) -> Result<()> {
         let entry = Self::keyring_entry(server_name)?;
@@ -71,9 +89,15 @@ impl Ssh {
     /// Launch SSH connection in a terminal. Passwords are passed via
     /// `SSH_ASKPASS`, never as command-line arguments.
     pub fn launch_connection(server: &Server, terminal: &str) -> Result<()> {
-        let ssh_args = Self::build_ssh_args(server);
+        let ssh_argv = Self::build_ssh_argv(server);
         let mut env: Vec<(String, String)> = Vec::new();
         let mut askpass_dir: Option<PathBuf> = None;
+
+        if let Ok(current_term) = env::var("TERM") {
+            if let Some(normalized) = Self::normalize_term(&current_term) {
+                env.push(("TERM".to_string(), normalized.to_string()));
+            }
+        }
 
         if server.auth_method == AuthMethod::Password {
             let password = Self::get_password(&server.name)?;
@@ -87,6 +111,31 @@ impl Ssh {
             askpass_dir = Some(dir);
         }
 
+        if Terminal::is_current_terminal(terminal) {
+            let mut cmd = std::process::Command::new(&ssh_argv[0]);
+            cmd.args(&ssh_argv[1..]);
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let status = cmd.status().map_err(|e| {
+                SshManagerError::SshLaunchFailed(format!(
+                    "Failed to execute {}: {}",
+                    ssh_argv[0], e
+                ))
+            })?;
+            if let Some(dir) = askpass_dir {
+                let _ = fs::remove_dir_all(dir);
+            }
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    eprintln!("\n[ssh exited with status {}]", code);
+                } else {
+                    eprintln!("\n[ssh terminated by signal]");
+                }
+            }
+            return Ok(());
+        }
+
         // Best-effort cleanup of the askpass directory after a short grace
         // period (ssh should have already read the password by the time the
         // terminal window is up).
@@ -98,7 +147,7 @@ impl Ssh {
             });
         }
 
-        let arg_refs: Vec<&str> = ssh_args.iter().map(String::as_str).collect();
+        let arg_refs: Vec<&str> = ssh_argv.iter().map(String::as_str).collect();
         let env_refs: Vec<(&str, &str)> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         Terminal::spawn_terminal(terminal, &arg_refs, &env_refs)?;
@@ -208,6 +257,13 @@ mod tests {
     }
 
     #[test]
+    fn build_ssh_argv_starts_with_ssh() {
+        let argv = Ssh::build_ssh_argv(&forward_server());
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert!(argv.contains(&"-A".to_string()));
+    }
+
+    #[test]
     fn build_ssh_args_password_never_present() {
         // Regression: the password must never leak into the argv.
         let mut s = password_server();
@@ -227,5 +283,14 @@ mod tests {
         // NoEntry error in a clean test env, not something else.
         let result = entry.get_password();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_term_replaces_kitty_and_alacritty() {
+        assert_eq!(Ssh::normalize_term("xterm-kitty"), Some("xterm-256color"));
+        assert_eq!(Ssh::normalize_term("kitty"), Some("xterm-256color"));
+        assert_eq!(Ssh::normalize_term("alacritty"), Some("xterm-256color"));
+        assert_eq!(Ssh::normalize_term("xterm-256color"), None);
+        assert_eq!(Ssh::normalize_term("linux"), None);
     }
 }

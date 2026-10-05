@@ -6,9 +6,17 @@ use std::process::Command;
 pub struct Terminal;
 
 impl Terminal {
+    /// Return true if the terminal name indicates connecting in the current terminal.
+    pub fn is_current_terminal(terminal: &str) -> bool {
+        matches!(terminal, "current" | "inline" | "none" | "internal")
+    }
+
     /// Get the terminal command to use, respecting user preference.
     pub fn get_terminal_command(preferred: Option<&str>) -> Result<String> {
         if let Some(pref) = preferred {
+            if Self::is_current_terminal(pref) {
+                return Ok("current".to_string());
+            }
             if Self::terminal_exists(pref) {
                 return Ok(pref.to_string());
             }
@@ -40,25 +48,41 @@ impl Terminal {
             ));
         }
 
+        let title = argv.join(" ");
         let mut cmd = match terminal {
             "gnome-terminal" => {
                 let mut c = Command::new("gnome-terminal");
+                c.arg("--title").arg(&title);
                 c.arg("--").arg("bash").arg("-c");
                 c
             }
             "konsole" => {
                 let mut c = Command::new("konsole");
+                c.arg("-p").arg(format!("tabtitle={}", title));
                 c.arg("-e").arg("bash").arg("-c");
                 c
             }
             "xfce4-terminal" => {
                 let mut c = Command::new("xfce4-terminal");
+                c.arg("--title").arg(&title);
                 c.arg("--command").arg("bash").arg("-c");
                 c
             }
             "xterm" => {
                 let mut c = Command::new("xterm");
-                c.arg("-e").arg("bash").arg("-c");
+                c.args([
+                    "-fa",
+                    "Monospace",
+                    "-fs",
+                    "14",
+                    "-geometry",
+                    "120x35",
+                    "-T",
+                    &title,
+                    "-e",
+                    "bash",
+                    "-c",
+                ]);
                 c
             }
             other => {
@@ -235,5 +259,24 @@ mod tests {
     fn spawn_terminal_rejects_empty_argv() {
         let res = Terminal::spawn_terminal("xterm", &[], &[]);
         assert!(matches!(res, Err(SshManagerError::SshLaunchFailed(_))));
+    }
+
+    #[test]
+    fn get_terminal_command_supports_current() {
+        assert_eq!(
+            Terminal::get_terminal_command(Some("current")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            Terminal::get_terminal_command(Some("inline")).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn is_current_terminal_identifies_aliases() {
+        assert!(Terminal::is_current_terminal("current"));
+        assert!(Terminal::is_current_terminal("inline"));
+        assert!(!Terminal::is_current_terminal("xterm"));
     }
 }
