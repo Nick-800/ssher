@@ -468,6 +468,26 @@ impl Tui {
             Some(af_choice == "y" || af_choice == "yes")
         };
 
+        let current_tags_desc = if server.tags.is_empty() {
+            "none".to_string()
+        } else {
+            server.tags.join(", ")
+        };
+        print!("Tags (comma-separated) [{}]: ", current_tags_desc);
+        io::stdout().flush()?;
+        let mut tags_str = String::new();
+        io::stdin().read_line(&mut tags_str)?;
+        let tags = if tags_str.trim().is_empty() {
+            None
+        } else {
+            let parsed: Vec<String> = tags_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(Storage::normalize_tags(&parsed)?)
+        };
+
         let edit = ServerEdit {
             new_name,
             host,
@@ -475,6 +495,7 @@ impl Tui {
             port,
             auth,
             agent_forwarding,
+            tags,
         };
 
         let mut config = Storage::load_config()?;
@@ -676,10 +697,10 @@ impl Tui {
             f.render_widget(no_match_msg, chunks[1]);
         } else {
             let col_header = format!(
-                "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
-                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW"
+                "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
+                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "TAGS"
             );
-            let separator = format!("  {}", "─".repeat(89));
+            let separator = format!("  {}", "─".repeat(95));
 
             let mut items = Vec::new();
             items.push(
@@ -698,11 +719,16 @@ impl Tui {
                     AuthMethod::Password => "password",
                 };
                 let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
+                let tags_str = if s.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    s.tags.join(", ")
+                };
 
                 if view_idx == selected_index {
                     let line = format!(
-                        "▶ {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str
+                        "▶ {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str, tags_str
                     );
                     items.push(
                         ListItem::new(line).style(
@@ -713,8 +739,8 @@ impl Tui {
                     );
                 } else {
                     let line = format!(
-                        "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str
+                        "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str, tags_str
                     );
                     items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
                 }
@@ -847,9 +873,9 @@ impl Tui {
     fn show_list() -> Result<()> {
         let config = crate::storage::Storage::load_config()?;
 
-        println!("\n{}", "=".repeat(95));
-        println!("{:^95}", "SSH SERVERS");
-        println!("{}", "=".repeat(95));
+        println!("\n{}", "=".repeat(110));
+        println!("{:^110}", "SSH SERVERS");
+        println!("{}", "=".repeat(110));
 
         if config.servers.is_empty() {
             println!("\nNo servers configured.\n");
@@ -857,10 +883,10 @@ impl Tui {
         }
 
         println!(
-            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
-            "Name", "Host", "Username", "Port", "Auth", "Agent FW"
+            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
+            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Tags"
         );
-        println!("{}", "─".repeat(95));
+        println!("{}", "─".repeat(110));
 
         for server in &config.servers {
             let auth = match server.auth_method {
@@ -872,10 +898,15 @@ impl Tui {
             } else {
                 "no"
             };
+            let tags_str = if server.tags.is_empty() {
+                "-".to_string()
+            } else {
+                server.tags.join(", ")
+            };
 
             println!(
-                "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
-                server.name, server.host, server.username, server.port, auth, agent_fw
+                "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
+                server.name, server.host, server.username, server.port, auth, agent_fw, tags_str
             );
         }
         println!();
@@ -944,6 +975,21 @@ impl Tui {
         io::stdin().read_line(&mut agent_choice)?;
         let agent_forwarding = agent_choice.trim().to_lowercase() == "y";
 
+        print!("Tags (comma-separated, optional): ");
+        io::stdout().flush()?;
+        let mut tags_str = String::new();
+        io::stdin().read_line(&mut tags_str)?;
+        let tags = if tags_str.trim().is_empty() {
+            Vec::new()
+        } else {
+            let parsed: Vec<String> = tags_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Storage::normalize_tags(&parsed)?
+        };
+
         // Validate inputs
         Storage::validate_server_name(name)?;
         Storage::validate_host(host)?;
@@ -965,6 +1011,7 @@ impl Tui {
             key_path,
         );
         server.use_agent_forwarding = agent_forwarding;
+        server.tags = tags;
 
         config.servers.push(server);
         Storage::save_config(&config)?;

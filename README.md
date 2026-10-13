@@ -6,6 +6,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 
 - **Server Management**: Add, list, and remove SSH server configurations
 - **Flexible Authentication**: Support both SSH key and password-based authentication
+- **Tags & Filtering**: Organize servers with tags, filter by tag sets, and search tags in the browser
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
 - **SSH Options**: Support for custom ports, SSH agent forwarding, and identity files
@@ -53,9 +54,9 @@ The application automatically creates `~/.config/ssh_manager/` on first run.
 
 ### Add a Server
 
-Add a server with SSH key authentication:
+Add a server with SSH key authentication and tags:
 ```bash
-ssher add myserver example.com username --key /path/to/key
+ssher add myserver example.com username --key /path/to/key --tag prod --tag web
 ```
 
 Add a server with password authentication:
@@ -70,16 +71,22 @@ ssher add myserver example.com username --key /path/to/key --port 2222 --agent-f
 
 ### List All Servers
 
+List all configured servers:
 ```bash
 ssher list
 ```
 
+Filter servers by tag (repeatable; matches servers having all specified tags):
+```bash
+ssher list --tag prod --tag web
+```
+
 Output:
 ```
-Name                 Host                 Username        Port       Auth         Agent FW
-─────────────────────────────────────────────────────────────────────────────────────────
-myserver             example.com          username        22         key          no
-prod-server          prod.example.com     root            22         password     yes
+Name                 Host                 Username        Port       Auth         Agent FW   Tags
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myserver             example.com          username        22         key          no         prod, web
+prod-server          prod.example.com     root            22         password     yes        -
 ```
 
 ### Connect to a Server
@@ -119,6 +126,12 @@ ssher edit myserver --password
 
 # Enable or disable agent forwarding
 ssher edit myserver --agent-forwarding false
+
+# Replace tags (repeatable, sets full tag set)
+ssher edit myserver --tag staging --tag api
+
+# Clear all tags
+ssher edit myserver --clear-tags
 ```
 
 ### Remove a Server
@@ -138,13 +151,15 @@ ssher
 
 Select **Browse Servers** to open the in-terminal server browser.
 
+The browser displays server tags in a dedicated column for quick visibility.
+
 #### Browser Keybindings:
 - `j` / `k` or `↓` / `↑`: Move selection up/down
 - `Enter`: Connect to selected server
-- `a`: Add a new server
-- `e`: Edit selected server in place (prompts show current values in brackets)
+- `a`: Add a new server (prompts include comma-separated tags)
+- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current tags)
 - `d`: Delete selected server (with y/n confirmation)
-- `/`: Filter servers by name or host (case-insensitive substring)
+- `/`: Filter servers by name, host, or tags (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
 
@@ -208,17 +223,18 @@ eval (ssher completions elvish | slurp)
 ssher completions powershell | Out-String | Invoke-Expression
 ```
 
-#### Dynamic Server Name Completion
+#### Dynamic Server Name and Tag Completion
 
-For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names for `connect`, `edit`, and `remove` via the hidden subcommand:
+For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names (for `connect`, `edit`, and `remove`) and distinct server tags (for `--tag`) via the hidden subcommands:
 
 ```bash
 ssher __complete-servers
+ssher __complete-tags
 ```
 
-`ssher __complete-servers` prints saved server names one per line (and produces no output with exit status 0 if configuration is missing or unreadable).
+`ssher __complete-servers` prints saved server names one per line. `ssher __complete-tags` prints distinct configured tags one per line in sorted order. Both produce no output with exit status 0 if configuration is missing or unreadable.
 
-If you generate static base completions or wish to wire dynamic server completion manually, append or source the snippet for your shell:
+If you generate static base completions or wish to wire dynamic completion manually, append or source the snippet for your shell:
 
 **Bash snippet:**
 ```bash
@@ -230,6 +246,14 @@ _ssher_complete() {
         --host|--username|--port|--key|--agent-forwarding|--new-name)
             _ssher "$@"
             return 0
+            ;;
+        --tag)
+            local tags
+            tags="$(ssher __complete-tags 2>/dev/null)"
+            if [[ -n "${tags}" ]]; then
+                COMPREPLY=( $(compgen -W "${tags}" -- "${cur}") )
+                return 0
+            fi
             ;;
     esac
 
@@ -272,11 +296,17 @@ _ssher_servers() {
     servers=(${(f)"$(ssher __complete-servers 2>/dev/null)"})
     _describe -t servers 'server' servers "$@"
 }
+_ssher_tags() {
+    local -a tags
+    tags=(${(f)"$(ssher __complete-tags 2>/dev/null)"})
+    _describe -t tags 'tag' tags "$@"
+}
 ```
 
 **Fish snippet:**
 ```fish
 complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 ```
 
 ## Configuration Files
@@ -342,6 +372,7 @@ ssher add <name> <host> <username> [OPTIONS]
   --password                    Use password authentication (interactive prompt)
   --port <port>                Default: 22
   --agent-forwarding           Enable SSH agent forwarding
+  --tag <tag>                  Server tag (repeatable)
 
 # Edit a server
 ssher edit <name> [OPTIONS]
@@ -352,9 +383,12 @@ ssher edit <name> [OPTIONS]
   --password                    Set new password (interactive prompt)
   --agent-forwarding <true|false> Enable or disable SSH agent forwarding
   --new-name <name>             New server identifier name
+  --tag <tag>                  Set server tags (repeatable, replaces current tags)
+  --clear-tags                 Clear all tags from server
 
 # List servers
-ssher list
+ssher list [OPTIONS]
+  --tag <tag>                  Filter by tag (repeatable, must match all)
 
 # Connect to a server (exact name or unambiguous partial match)
 ssher connect <name> [OPTIONS]

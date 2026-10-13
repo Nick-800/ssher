@@ -154,6 +154,35 @@ impl Storage {
         Ok(())
     }
 
+    pub fn validate_tag(tag: &str) -> Result<()> {
+        if tag.is_empty() {
+            return Err(SshManagerError::EmptyTag);
+        }
+        if tag.len() > 32 {
+            return Err(SshManagerError::TagTooLong(tag.to_string()));
+        }
+        if tag.contains(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+            return Err(SshManagerError::InvalidTag(tag.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn normalize_tags<S: AsRef<str>>(tags: &[S]) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for tag in tags {
+            let t = tag.as_ref();
+            Self::validate_tag(t)?;
+            let lower = t.to_lowercase();
+            if seen.insert(lower.clone()) {
+                result.push(lower);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Execute server edit, handling validation, keyring side-effects, and config persistence.
     pub fn execute_server_edit(
         config: &mut Config,
@@ -348,6 +377,84 @@ mod tests {
     }
 
     #[test]
+    fn validate_tag_accepts_valid() {
+        assert!(Storage::validate_tag("a").is_ok());
+        assert!(Storage::validate_tag("prod").is_ok());
+        assert!(Storage::validate_tag("web-server_01").is_ok());
+        assert!(Storage::validate_tag("ABC-123_xyz").is_ok());
+        let exact_32 = "a".repeat(32);
+        assert!(Storage::validate_tag(&exact_32).is_ok());
+    }
+
+    #[test]
+    fn validate_tag_rejects_empty() {
+        assert!(matches!(
+            Storage::validate_tag(""),
+            Err(SshManagerError::EmptyTag)
+        ));
+    }
+
+    #[test]
+    fn validate_tag_rejects_too_long() {
+        let too_long = "a".repeat(33);
+        assert!(matches!(
+            Storage::validate_tag(&too_long),
+            Err(SshManagerError::TagTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn validate_tag_rejects_invalid_chars() {
+        for bad in [
+            "has space",
+            "tag@1",
+            "tag.dot",
+            "tag:colon",
+            "tag#hash",
+            "tag!",
+        ] {
+            assert!(
+                matches!(
+                    Storage::validate_tag(bad),
+                    Err(SshManagerError::InvalidTag(_))
+                ),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_tags_lowercases_deduplicates_and_preserves_order() {
+        let input = vec![
+            "Web".to_string(),
+            "PROD".to_string(),
+            "web".to_string(),
+            "DB-01".to_string(),
+            "prod".to_string(),
+            "stage_2".to_string(),
+        ];
+        let normalized = Storage::normalize_tags(&input).expect("valid tags");
+        assert_eq!(
+            normalized,
+            vec![
+                "web".to_string(),
+                "prod".to_string(),
+                "db-01".to_string(),
+                "stage_2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_tags_rejects_invalid() {
+        let input = vec!["valid".to_string(), "invalid tag".to_string()];
+        assert!(matches!(
+            Storage::normalize_tags(&input),
+            Err(SshManagerError::InvalidTag(_))
+        ));
+    }
+
+    #[test]
     fn server_name_is_unique_basic() {
         let mut cfg = Config::new();
         cfg.servers.push(sample_server("a"));
@@ -391,6 +498,21 @@ mod tests {
         let loaded = Storage::load_config().expect("load");
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].name, "a");
+        assert!(loaded.servers[0].tags.is_empty());
+    }
+
+    #[test]
+    fn legacy_object_format_without_tags_still_loads() {
+        let _scope = ScopedConfigDir::new();
+        let servers_file = Storage::get_servers_file().expect("servers path");
+        let legacy_json = r#"{"servers":[{"name":"srv1","host":"srv1.com","username":"bob","port":22,"auth_method":"password","use_agent_forwarding":false}],"preferred_terminal":"xterm"}"#;
+        fs::write(&servers_file, legacy_json).unwrap();
+
+        let loaded = Storage::load_config().expect("load");
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(loaded.servers[0].name, "srv1");
+        assert!(loaded.servers[0].tags.is_empty());
+        assert_eq!(loaded.preferred_terminal.as_deref(), Some("xterm"));
     }
 
     #[test]

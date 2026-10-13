@@ -21,6 +21,8 @@ pub struct Server {
     pub key_path: Option<String>,
     #[serde(default)]
     pub use_agent_forwarding: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +72,7 @@ impl Server {
             auth_method,
             key_path,
             use_agent_forwarding: false,
+            tags: Vec::new(),
         }
     }
 }
@@ -82,6 +85,7 @@ pub struct ServerEdit {
     pub port: Option<u16>,
     pub auth: Option<AuthEdit>,
     pub agent_forwarding: Option<bool>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +102,7 @@ impl ServerEdit {
             && self.port.is_none()
             && self.auth.is_none()
             && self.agent_forwarding.is_none()
+            && self.tags.is_none()
     }
 
     pub fn apply(&self, server: &mut Server, config: &Config) -> Result<()> {
@@ -128,6 +133,12 @@ impl ServerEdit {
             Storage::validate_key_path(key_path)?;
         }
 
+        let normalized_tags = if let Some(tags) = &self.tags {
+            Some(Storage::normalize_tags(tags)?)
+        } else {
+            None
+        };
+
         if let Some(new_name) = &self.new_name {
             server.name = new_name.clone();
         }
@@ -154,19 +165,24 @@ impl ServerEdit {
         if let Some(af) = self.agent_forwarding {
             server.use_agent_forwarding = af;
         }
+        if let Some(tags) = normalized_tags {
+            server.tags = tags;
+        }
 
         Ok(())
     }
 }
 
-/// Check if a server matches a case-insensitive query across its name or host.
+/// Check if a server matches a case-insensitive query across its name, host, or tags.
 /// An empty query matches every server.
 pub fn server_matches_query(server: &Server, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let q = query.to_lowercase();
-    server.name.to_lowercase().contains(&q) || server.host.to_lowercase().contains(&q)
+    server.name.to_lowercase().contains(&q)
+        || server.host.to_lowercase().contains(&q)
+        || server.tags.iter().any(|t| t.to_lowercase().contains(&q))
 }
 
 /// Filter a list of servers by query, returning indices into the slice.
@@ -226,6 +242,22 @@ pub fn format_server_completions(servers: &[Server]) -> String {
     output
 }
 
+/// Format distinct tags across all servers for shell completion (one per line, sorted).
+pub fn format_tag_completions(servers: &[Server]) -> String {
+    let mut tags: Vec<String> = servers
+        .iter()
+        .flat_map(|s| s.tags.iter().cloned())
+        .collect();
+    tags.sort();
+    tags.dedup();
+    let mut output = String::new();
+    for tag in tags {
+        output.push_str(&tag);
+        output.push('\n');
+    }
+    output
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalConfig {
     pub terminal: String,
@@ -254,11 +286,35 @@ mod tests {
             Some("/home/alice/.ssh/id_ed25519".to_string()),
         );
         s.use_agent_forwarding = true;
+        s.tags = vec!["prod".to_string(), "web".to_string()];
         let json = serde_json::to_string(&s).unwrap();
         let back: Server = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "alpha");
         assert_eq!(back.auth_method, AuthMethod::Key);
         assert!(back.use_agent_forwarding);
+        assert_eq!(back.tags, vec!["prod".to_string(), "web".to_string()]);
+    }
+
+    #[test]
+    fn server_tags_omitted_when_empty() {
+        let s = Server::new(
+            "alpha".to_string(),
+            "example.com".to_string(),
+            "alice".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("tags"), "json was: {json}");
+    }
+
+    #[test]
+    fn server_parses_from_json_without_tags_backward_compat() {
+        let legacy_json = r#"{"name":"legacy","host":"legacy.net","username":"user","port":22,"auth_method":"key"}"#;
+        let s: Server = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(s.name, "legacy");
+        assert!(s.tags.is_empty());
     }
 
     #[test]
@@ -378,12 +434,35 @@ mod tests {
         };
         assert!(edit_name.apply(&mut s, &cfg).is_ok());
         assert_eq!(s.name, "beta");
+
+        let edit_tags = ServerEdit {
+            tags: Some(vec!["PROD".to_string(), "Web".to_string()]),
+            ..Default::default()
+        };
+        assert!(edit_tags.apply(&mut s, &cfg).is_ok());
+        assert_eq!(s.tags, vec!["prod".to_string(), "web".to_string()]);
+
+        let edit_tags_clear = ServerEdit {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(edit_tags_clear.apply(&mut s, &cfg).is_ok());
+        assert!(s.tags.is_empty());
     }
 
     #[test]
     fn edit_apply_validation_failures() {
         let mut s = sample_server("alpha");
         let cfg = Config::new();
+
+        let bad_tag = ServerEdit {
+            tags: Some(vec!["invalid tag!".to_string()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_tag.apply(&mut s, &cfg),
+            Err(SshManagerError::InvalidTag(_))
+        ));
 
         let bad_name = ServerEdit {
             new_name: Some("".to_string()),
@@ -530,14 +609,28 @@ mod tests {
         assert!(!server_matches_query(&s, "staging"));
         assert!(!server_matches_query(&s, "xyz"));
 
+        // Match on tag (case-insensitive)
+        let mut s_with_tags = s.clone();
+        s_with_tags.tags = vec!["backend".to_string(), "critical".to_string()];
+        assert!(server_matches_query(&s_with_tags, "back"));
+        assert!(server_matches_query(&s_with_tags, "BACKEND"));
+        assert!(server_matches_query(&s_with_tags, "crit"));
+        assert!(!server_matches_query(&s_with_tags, "frontend"));
+
         // filter_server_indices
-        let servers = vec![
-            sample_server("web-prod"),
-            sample_server("db-prod"),
-            sample_server("staging-web"),
-        ];
+        let mut s1 = sample_server("web-prod");
+        s1.tags = vec!["frontend".to_string()];
+        let mut s2 = sample_server("db-prod");
+        s2.tags = vec!["database".to_string()];
+        let mut s3 = sample_server("staging-web");
+        s3.tags = vec!["frontend".to_string()];
+
+        let servers = vec![s1, s2, s3];
         let indices = filter_server_indices(&servers, "prod");
         assert_eq!(indices, vec![0, 1]);
+
+        let indices_tag = filter_server_indices(&servers, "frontend");
+        assert_eq!(indices_tag, vec![0, 2]);
 
         let indices_none = filter_server_indices(&servers, "nomatch");
         assert!(indices_none.is_empty());
@@ -608,5 +701,23 @@ mod tests {
             format_server_completions(&servers),
             "web-prod\ndb-staging\nbackup_01\n"
         );
+    }
+
+    #[test]
+    fn format_tag_completions_empty() {
+        let servers: Vec<Server> = Vec::new();
+        assert_eq!(format_tag_completions(&servers), "");
+    }
+
+    #[test]
+    fn format_tag_completions_multiple_deduplicated_and_sorted() {
+        let mut s1 = sample_server("s1");
+        s1.tags = vec!["web".to_string(), "prod".to_string()];
+        let mut s2 = sample_server("s2");
+        s2.tags = vec!["prod".to_string(), "api".to_string()];
+        let mut s3 = sample_server("s3");
+        s3.tags = vec![];
+        let servers = vec![s1, s2, s3];
+        assert_eq!(format_tag_completions(&servers), "api\nprod\nweb\n");
     }
 }

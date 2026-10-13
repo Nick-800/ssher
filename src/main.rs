@@ -44,6 +44,9 @@ enum Commands {
         /// Enable SSH agent forwarding
         #[arg(short, long)]
         agent_forwarding: bool,
+        /// Server tags (repeatable)
+        #[arg(long = "tag", action = clap::ArgAction::Append)]
+        tag: Vec<String>,
     },
 
     /// Modify a saved SSH server
@@ -71,10 +74,20 @@ enum Commands {
         /// New server name (identifier)
         #[arg(long)]
         new_name: Option<String>,
+        /// Set server tags (repeatable, replaces current tags)
+        #[arg(long = "tag", conflicts_with = "clear_tags", action = clap::ArgAction::Append)]
+        tag: Option<Vec<String>>,
+        /// Clear all tags from server
+        #[arg(long, conflicts_with = "tag")]
+        clear_tags: bool,
     },
 
     /// List all saved SSH servers
-    List,
+    List {
+        /// Filter servers by tag (repeatable, must have all tags)
+        #[arg(long = "tag", action = clap::ArgAction::Append)]
+        tag: Vec<String>,
+    },
 
     /// Connect to a saved SSH server
     Connect {
@@ -99,6 +112,9 @@ enum Commands {
 
     #[command(name = "__complete-servers", hide = true)]
     CompleteServers,
+
+    #[command(name = "__complete-tags", hide = true)]
+    CompleteTags,
 
     /// Configure SSH manager settings
     Config {
@@ -148,7 +164,19 @@ fn run(cli: Cli) -> Result<()> {
             key,
             password,
             agent_forwarding,
-        } => add_server(name, host, username, port, key, password, agent_forwarding),
+            tag,
+        } => add_server(
+            name,
+            AddArgs {
+                host,
+                username,
+                port,
+                key,
+                use_password: password,
+                agent_forwarding,
+                tags: tag,
+            },
+        ),
         Commands::Edit {
             name,
             host,
@@ -158,43 +186,53 @@ fn run(cli: Cli) -> Result<()> {
             password,
             agent_forwarding,
             new_name,
-        } => edit_server(
-            name,
-            EditArgs {
-                host,
-                username,
-                port,
-                key,
-                password,
-                agent_forwarding,
-                new_name,
-            },
-        ),
-        Commands::List => list_servers(),
+            tag,
+            clear_tags,
+        } => {
+            let tags = if clear_tags { Some(Vec::new()) } else { tag };
+            edit_server(
+                name,
+                EditArgs {
+                    host,
+                    username,
+                    port,
+                    key,
+                    password,
+                    agent_forwarding,
+                    new_name,
+                    tags,
+                },
+            )
+        }
+        Commands::List { tag } => list_servers(&tag),
         Commands::Connect { name, current } => connect_server(&name, current),
         Commands::Remove { name } => remove_server(&name),
         Commands::Completions { shell } => generate_completions(shell),
         Commands::CompleteServers => complete_servers(),
+        Commands::CompleteTags => complete_tags(),
         Commands::Config {
             action: ConfigAction::Terminal { name },
         } => set_terminal_config(&name),
     }
 }
 
-fn add_server(
-    name: String,
+struct AddArgs {
     host: String,
     username: String,
     port: u16,
     key: Option<String>,
     use_password: bool,
     agent_forwarding: bool,
-) -> Result<()> {
+    tags: Vec<String>,
+}
+
+fn add_server(name: String, args: AddArgs) -> Result<()> {
     // Validate inputs
     Storage::validate_server_name(&name)?;
-    Storage::validate_host(&host)?;
-    Storage::validate_username(&username)?;
-    Storage::validate_port(port)?;
+    Storage::validate_host(&args.host)?;
+    Storage::validate_username(&args.username)?;
+    Storage::validate_port(args.port)?;
+    let normalized_tags = Storage::normalize_tags(&args.tags)?;
 
     let mut config = Storage::load_config()?;
 
@@ -207,14 +245,14 @@ fn add_server(
     let auth_method;
     let key_path;
 
-    if let Some(key_file) = key {
+    if let Some(key_file) = args.key {
         // Key-based authentication
         Storage::validate_key_path(&key_file)?;
         auth_method = AuthMethod::Key;
         key_path = Some(key_file);
-    } else if use_password {
+    } else if args.use_password {
         // Password-based authentication
-        print!("Enter password for {}@{}: ", username, host);
+        print!("Enter password for {}@{}: ", args.username, args.host);
         io::stdout().flush()?;
 
         let password = rpassword::read_password().map_err(|e| {
@@ -238,8 +276,16 @@ fn add_server(
         ));
     }
 
-    let mut server = Server::new(name.clone(), host, username, port, auth_method, key_path);
-    server.use_agent_forwarding = agent_forwarding;
+    let mut server = Server::new(
+        name.clone(),
+        args.host,
+        args.username,
+        args.port,
+        auth_method,
+        key_path,
+    );
+    server.use_agent_forwarding = args.agent_forwarding;
+    server.tags = normalized_tags;
 
     config.servers.push(server);
     Storage::save_config(&config)?;
@@ -248,7 +294,7 @@ fn add_server(
     Ok(())
 }
 
-fn list_servers() -> Result<()> {
+fn list_servers(filter_tags: &[String]) -> Result<()> {
     let config = Storage::load_config()?;
 
     if config.servers.is_empty() {
@@ -256,13 +302,34 @@ fn list_servers() -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
-        "Name", "Host", "Username", "Port", "Auth", "Agent FW"
-    );
-    println!("{}", "─".repeat(95));
+    for tag in filter_tags {
+        Storage::validate_tag(tag)?;
+    }
 
-    for server in &config.servers {
+    let normalized_filters: Vec<String> = filter_tags.iter().map(|t| t.to_lowercase()).collect();
+
+    let matching_servers: Vec<&Server> = config
+        .servers
+        .iter()
+        .filter(|server| {
+            normalized_filters
+                .iter()
+                .all(|ft| server.tags.iter().any(|st| st == ft))
+        })
+        .collect();
+
+    if matching_servers.is_empty() {
+        println!("No servers match the specified tag(s).");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
+        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Tags"
+    );
+    println!("{}", "─".repeat(110));
+
+    for server in matching_servers {
         let auth = match server.auth_method {
             AuthMethod::Key => "key",
             AuthMethod::Password => "password",
@@ -272,10 +339,15 @@ fn list_servers() -> Result<()> {
         } else {
             "no"
         };
+        let tags_str = if server.tags.is_empty() {
+            "-".to_string()
+        } else {
+            server.tags.join(", ")
+        };
 
         println!(
-            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<8}",
-            server.name, server.host, server.username, server.port, auth, agent_fw
+            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
+            server.name, server.host, server.username, server.port, auth, agent_fw, tags_str
         );
     }
 
@@ -290,6 +362,7 @@ struct EditArgs {
     password: bool,
     agent_forwarding: Option<bool>,
     new_name: Option<String>,
+    tags: Option<Vec<String>>,
 }
 
 fn edit_server(name: String, args: EditArgs) -> Result<()> {
@@ -300,6 +373,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         && !args.password
         && args.agent_forwarding.is_none()
         && args.new_name.is_none()
+        && args.tags.is_none()
     {
         return Err(error::SshManagerError::NothingToChange);
     }
@@ -337,6 +411,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         port: args.port,
         auth,
         agent_forwarding: args.agent_forwarding,
+        tags: args.tags,
     };
 
     Storage::execute_server_edit(&mut config, &name, edit, new_password)?;
@@ -413,6 +488,14 @@ _ssher_complete() {
             _ssher "$@"
             return 0
             ;;
+        --tag)
+            local tags
+            tags="$(ssher __complete-tags 2>/dev/null)"
+            if [[ -n "${tags}" ]]; then
+                COMPREPLY=( $(compgen -W "${tags}" -- "${cur}") )
+                return 0
+            fi
+            ;;
     esac
 
     local subcmd=""
@@ -452,6 +535,7 @@ fi
             let fish_snippet = r#"
 # Dynamic server completion for connect, edit, remove
 complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 "#;
             format!("{raw}{fish_snippet}")
         }
@@ -475,6 +559,11 @@ _ssher_servers() {
     servers=(${(f)"$(ssher __complete-servers 2>/dev/null)"})
     _describe -t servers 'server' servers "$@"
 }
+_ssher_tags() {
+    local -a tags
+    tags=(${(f)"$(ssher __complete-tags 2>/dev/null)"})
+    _describe -t tags 'tag' tags "$@"
+}
 "#;
             format!("{modified}{zsh_snippet}")
         }
@@ -491,6 +580,15 @@ fn generate_completions(shell: clap_complete::Shell) -> Result<()> {
 fn complete_servers() -> Result<()> {
     if let Ok(config) = Storage::load_config() {
         let output = models::format_server_completions(&config.servers);
+        let _ = io::stdout().write_all(output.as_bytes());
+        let _ = io::stdout().flush();
+    }
+    Ok(())
+}
+
+fn complete_tags() -> Result<()> {
+    if let Ok(config) = Storage::load_config() {
+        let output = models::format_tag_completions(&config.servers);
         let _ = io::stdout().write_all(output.as_bytes());
         let _ = io::stdout().flush();
     }
@@ -530,6 +628,8 @@ mod tests {
                 password,
                 agent_forwarding,
                 new_name,
+                tag,
+                clear_tags,
             } => {
                 assert_eq!(name, "myserver");
                 assert_eq!(host.as_deref(), Some("example.com"));
@@ -539,6 +639,8 @@ mod tests {
                 assert!(!password);
                 assert_eq!(agent_forwarding, Some(true));
                 assert_eq!(new_name.as_deref(), Some("newserver"));
+                assert_eq!(tag, None);
+                assert!(!clear_tags);
             }
             _ => panic!("expected Commands::Edit"),
         }
@@ -556,6 +658,80 @@ mod tests {
                 assert_eq!(agent_forwarding, Some(false));
             }
             _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_add_tags() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "add",
+            "srv",
+            "1.2.3.4",
+            "root",
+            "--password",
+            "--tag",
+            "web",
+            "--tag",
+            "prod",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Add { tag, .. } => {
+                assert_eq!(tag, vec!["web".to_string(), "prod".to_string()]);
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_tags() {
+        let cli =
+            Cli::try_parse_from(["ssher", "edit", "myserver", "--tag", "web", "--tag", "prod"])
+                .unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                tag, clear_tags, ..
+            } => {
+                assert_eq!(tag, Some(vec!["web".to_string(), "prod".to_string()]));
+                assert!(!clear_tags);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_clear_tags() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "myserver", "--clear-tags"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                tag, clear_tags, ..
+            } => {
+                assert_eq!(tag, None);
+                assert!(clear_tags);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_tags_and_clear_tags_conflict() {
+        let res =
+            Cli::try_parse_from(["ssher", "edit", "myserver", "--tag", "web", "--clear-tags"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cli_parse_list_tags() {
+        let cli = Cli::try_parse_from(["ssher", "list", "--tag", "web", "--tag", "prod"]).unwrap();
+        match cli.command {
+            Commands::List { tag } => {
+                assert_eq!(tag, vec!["web".to_string(), "prod".to_string()]);
+            }
+            _ => panic!("expected Commands::List"),
         }
     }
 
@@ -610,6 +786,12 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_complete_tags_subcommand() {
+        let cli = Cli::try_parse_from(["ssher", "__complete-tags"]).unwrap();
+        assert!(matches!(cli.command, Commands::CompleteTags));
+    }
+
+    #[test]
     fn completion_scripts_generated_for_all_shells() {
         for shell in [
             clap_complete::Shell::Bash,
@@ -631,14 +813,18 @@ mod tests {
 
         let bash = generate_completion_script(clap_complete::Shell::Bash);
         assert!(bash.contains("__complete-servers"));
+        assert!(bash.contains("__complete-tags"));
         assert!(bash.contains("_ssher_complete"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
+        assert!(zsh.contains("__complete-tags"));
         assert!(zsh.contains("_ssher_servers"));
+        assert!(zsh.contains("_ssher_tags"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
+        assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
     }
 }

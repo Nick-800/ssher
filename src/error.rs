@@ -48,6 +48,15 @@ pub enum SshManagerError {
     #[error("Port must be between 1 and 65535")]
     InvalidPort,
 
+    #[error("Tag cannot be empty")]
+    EmptyTag,
+
+    #[error("Tag contains invalid characters: {0}")]
+    InvalidTag(String),
+
+    #[error("Tag exceeds maximum length of 32 characters: {0}")]
+    TagTooLong(String),
+
     #[error("Password not found in keyring for server: {0}")]
     PasswordNotInKeyring(String),
 
