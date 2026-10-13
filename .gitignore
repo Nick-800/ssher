@@ -15,3 +15,5 @@ Cargo.lock
 # Environment
 .env
 .env.local
+
+a.out
