@@ -216,6 +216,16 @@ pub fn resolve_server<'a>(servers: &'a [Server], query: &str) -> Result<&'a Serv
     }
 }
 
+/// Format server names for shell completion (one per line).
+pub fn format_server_completions(servers: &[Server]) -> String {
+    let mut output = String::new();
+    for server in servers {
+        output.push_str(&server.name);
+        output.push('\n');
+    }
+    output
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalConfig {
     pub terminal: String,
@@ -573,5 +583,30 @@ mod tests {
         // Empty query
         let empty_err = resolve_server(&servers, "").unwrap_err();
         assert!(matches!(empty_err, SshManagerError::ServerNotFound(q) if q.is_empty()));
+    }
+
+    #[test]
+    fn format_server_completions_empty() {
+        let servers: Vec<Server> = Vec::new();
+        assert_eq!(format_server_completions(&servers), "");
+    }
+
+    #[test]
+    fn format_server_completions_single() {
+        let servers = vec![sample_server("alpha")];
+        assert_eq!(format_server_completions(&servers), "alpha\n");
+    }
+
+    #[test]
+    fn format_server_completions_multiple() {
+        let servers = vec![
+            sample_server("web-prod"),
+            sample_server("db-staging"),
+            sample_server("backup_01"),
+        ];
+        assert_eq!(
+            format_server_completions(&servers),
+            "web-prod\ndb-staging\nbackup_01\n"
+        );
     }
 }

@@ -9,6 +9,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
 - **SSH Options**: Support for custom ports, SSH agent forwarding, and identity files
+- **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name completion
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -157,6 +158,127 @@ ssher config terminal xterm
 
 The application will use your preferred terminal for all connections. If the preferred terminal is not available, it will fall back to the first available option (gnome-terminal, then xterm).
 
+### Shell Completions
+
+Generate completion scripts for your shell using `ssher completions`:
+
+```bash
+ssher completions <bash|zsh|fish|elvish|powershell>
+```
+
+#### Quick Setup
+
+**Bash:**
+```bash
+# Add to ~/.bashrc:
+source <(ssher completions bash)
+```
+Or persist into your user completions directory:
+```bash
+ssher completions bash > ~/.local/share/bash-completion/completions/ssher
+```
+
+**Zsh:**
+```zsh
+# Add to ~/.zshrc:
+source <(ssher completions zsh)
+```
+Or save to a completion directory in your `$fpath` (e.g. `~/.zfunc/_ssher`):
+```zsh
+ssher completions zsh > ~/.zfunc/_ssher
+```
+
+**Fish:**
+```fish
+# Add to ~/.config/fish/config.fish:
+ssher completions fish | source
+```
+Or persist into your fish completions folder:
+```fish
+ssher completions fish > ~/.config/fish/completions/ssher.fish
+```
+
+**Elvish:**
+```elvish
+eval (ssher completions elvish | slurp)
+```
+
+**PowerShell:**
+```powershell
+ssher completions powershell | Out-String | Invoke-Expression
+```
+
+#### Dynamic Server Name Completion
+
+For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names for `connect`, `edit`, and `remove` via the hidden subcommand:
+
+```bash
+ssher __complete-servers
+```
+
+`ssher __complete-servers` prints saved server names one per line (and produces no output with exit status 0 if configuration is missing or unreadable).
+
+If you generate static base completions or wish to wire dynamic server completion manually, append or source the snippet for your shell:
+
+**Bash snippet:**
+```bash
+_ssher_complete() {
+    local cur="${2:-${COMP_WORDS[COMP_CWORD]}}"
+    local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
+
+    case "${prev}" in
+        --host|--username|--port|--key|--agent-forwarding|--new-name)
+            _ssher "$@"
+            return 0
+            ;;
+    esac
+
+    local subcmd=""
+    for (( i=1; i < COMP_CWORD; i++ )); do
+        case "${COMP_WORDS[i]}" in
+            connect|edit|remove)
+                subcmd="${COMP_WORDS[i]}"
+                break
+                ;;
+            add|list|completions|config|help)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "${subcmd}" && "${cur}" != -* ]]; then
+        local servers
+        servers="$(ssher __complete-servers 2>/dev/null)"
+        if [[ -n "${servers}" ]]; then
+            COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
+            return 0
+        fi
+    fi
+
+    _ssher "$@"
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _ssher_complete -o nosort -o bashdefault -o default ssher
+else
+    complete -F _ssher_complete -o bashdefault -o default ssher
+fi
+```
+
+**Zsh snippet:**
+```zsh
+_ssher_servers() {
+    local -a servers
+    servers=(${(f)"$(ssher __complete-servers 2>/dev/null)"})
+    _describe -t servers 'server' servers "$@"
+}
+```
+
+**Fish snippet:**
+```fish
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+```
+
 ## Configuration Files
 
 All configuration is stored in `~/.config/ssh_manager/`:
@@ -243,6 +365,9 @@ ssher remove <name>
 
 # Configure settings
 ssher config terminal <terminal-name>
+
+# Generate shell completion script
+ssher completions <bash|zsh|fish|elvish|powershell>
 ```
 
 ## Building from Source

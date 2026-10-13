@@ -5,7 +5,7 @@ mod storage;
 mod terminal;
 mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use error::Result;
 use models::{AuthMethod, Server};
 use ssh::Ssh;
@@ -91,6 +91,15 @@ enum Commands {
         name: String,
     },
 
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    #[command(name = "__complete-servers", hide = true)]
+    CompleteServers,
+
     /// Configure SSH manager settings
     Config {
         #[command(subcommand)]
@@ -164,6 +173,8 @@ fn run(cli: Cli) -> Result<()> {
         Commands::List => list_servers(),
         Commands::Connect { name, current } => connect_server(&name, current),
         Commands::Remove { name } => remove_server(&name),
+        Commands::Completions { shell } => generate_completions(shell),
+        Commands::CompleteServers => complete_servers(),
         Commands::Config {
             action: ConfigAction::Terminal { name },
         } => set_terminal_config(&name),
@@ -383,6 +394,109 @@ fn set_terminal_config(terminal_name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn generate_completion_script(shell: clap_complete::Shell) -> String {
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "ssher", &mut buf);
+    let raw = String::from_utf8(buf).expect("completion script is valid UTF-8");
+
+    match shell {
+        clap_complete::Shell::Bash => {
+            let bash_snippet = r#"
+# Dynamic server completion for connect, edit, remove
+_ssher_complete() {
+    local cur="${2:-${COMP_WORDS[COMP_CWORD]}}"
+    local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
+
+    case "${prev}" in
+        --host|--username|--port|--key|--agent-forwarding|--new-name)
+            _ssher "$@"
+            return 0
+            ;;
+    esac
+
+    local subcmd=""
+    for (( i=1; i < COMP_CWORD; i++ )); do
+        case "${COMP_WORDS[i]}" in
+            connect|edit|remove)
+                subcmd="${COMP_WORDS[i]}"
+                break
+                ;;
+            add|list|completions|config|help)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "${subcmd}" && "${cur}" != -* ]]; then
+        local servers
+        servers="$(ssher __complete-servers 2>/dev/null)"
+        if [[ -n "${servers}" ]]; then
+            COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
+            return 0
+        fi
+    fi
+
+    _ssher "$@"
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _ssher_complete -o nosort -o bashdefault -o default ssher
+else
+    complete -F _ssher_complete -o bashdefault -o default ssher
+fi
+"#;
+            format!("{raw}{bash_snippet}")
+        }
+        clap_complete::Shell::Fish => {
+            let fish_snippet = r#"
+# Dynamic server completion for connect, edit, remove
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+"#;
+            format!("{raw}{fish_snippet}")
+        }
+        clap_complete::Shell::Zsh => {
+            let modified = raw
+                .replace(
+                    ":name -- Server name to connect to:_default",
+                    ":name -- Server name to connect to:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to edit:_default",
+                    ":name -- Server name to edit:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to remove:_default",
+                    ":name -- Server name to remove:_ssher_servers",
+                );
+            let zsh_snippet = r#"
+_ssher_servers() {
+    local -a servers
+    servers=(${(f)"$(ssher __complete-servers 2>/dev/null)"})
+    _describe -t servers 'server' servers "$@"
+}
+"#;
+            format!("{modified}{zsh_snippet}")
+        }
+        _ => raw,
+    }
+}
+
+fn generate_completions(shell: clap_complete::Shell) -> Result<()> {
+    let script = generate_completion_script(shell);
+    io::stdout().write_all(script.as_bytes())?;
+    Ok(())
+}
+
+fn complete_servers() -> Result<()> {
+    if let Ok(config) = Storage::load_config() {
+        let output = models::format_server_completions(&config.servers);
+        let _ = io::stdout().write_all(output.as_bytes());
+        let _ = io::stdout().flush();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +582,63 @@ mod tests {
             }
             _ => panic!("expected Commands::Connect"),
         }
+    }
+
+    #[test]
+    fn cli_parse_completions_subcommand() {
+        for (shell_arg, expected) in [
+            ("bash", clap_complete::Shell::Bash),
+            ("zsh", clap_complete::Shell::Zsh),
+            ("fish", clap_complete::Shell::Fish),
+            ("elvish", clap_complete::Shell::Elvish),
+            ("powershell", clap_complete::Shell::PowerShell),
+        ] {
+            let cli = Cli::try_parse_from(["ssher", "completions", shell_arg]).unwrap();
+            match cli.command {
+                Commands::Completions { shell } => assert_eq!(shell, expected),
+                _ => panic!("expected Commands::Completions"),
+            }
+        }
+
+        assert!(Cli::try_parse_from(["ssher", "completions", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_complete_servers_subcommand() {
+        let cli = Cli::try_parse_from(["ssher", "__complete-servers"]).unwrap();
+        assert!(matches!(cli.command, Commands::CompleteServers));
+    }
+
+    #[test]
+    fn completion_scripts_generated_for_all_shells() {
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Elvish,
+            clap_complete::Shell::PowerShell,
+        ] {
+            let script = generate_completion_script(shell);
+            assert!(
+                !script.is_empty(),
+                "script should not be empty for {shell:?}"
+            );
+            assert!(
+                script.contains("ssher"),
+                "script should mention ssher for {shell:?}"
+            );
+        }
+
+        let bash = generate_completion_script(clap_complete::Shell::Bash);
+        assert!(bash.contains("__complete-servers"));
+        assert!(bash.contains("_ssher_complete"));
+
+        let zsh = generate_completion_script(clap_complete::Shell::Zsh);
+        assert!(zsh.contains("__complete-servers"));
+        assert!(zsh.contains("_ssher_servers"));
+
+        let fish = generate_completion_script(clap_complete::Shell::Fish);
+        assert!(fish.contains("__complete-servers"));
+        assert!(fish.contains("__fish_ssher_using_subcommand"));
     }
 }
