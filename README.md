@@ -83,14 +83,42 @@ prod-server          prod.example.com     root            22         password   
 
 ### Connect to a Server
 
+Connect by full server name or unambiguous partial name:
 ```bash
 ssher connect myserver
+ssher connect my       # connects to myserver if it is the only matching server
 ```
 
+Options:
+- `-c`, `--current`: Connect directly in the current terminal instead of spawning an external window
+
 This will:
-1. Open a new terminal window
+1. Open a new terminal window (or connect in the current terminal with `-c`)
 2. Execute the SSH command with the stored credentials
 3. Keep the terminal open after disconnection for review
+
+Exact name matches always take precedence. If multiple servers match a partial query, an error lists all candidate matches.
+
+### Edit a Server
+
+Modify an existing server configuration in place:
+
+```bash
+# Update host and port
+ssher edit myserver --host new.example.com --port 2222
+
+# Rename a server (automatically transfers keyring password if using password auth)
+ssher edit myserver --new-name prodserver
+
+# Switch to key authentication
+ssher edit myserver --key /path/to/key
+
+# Switch to password authentication (interactive password prompt)
+ssher edit myserver --password
+
+# Enable or disable agent forwarding
+ssher edit myserver --agent-forwarding false
+```
 
 ### Remove a Server
 
@@ -99,6 +127,25 @@ ssher remove myserver
 ```
 
 This will remove the server configuration and clean up any stored password from the keyring.
+
+### Interactive TUI & Server Browser
+
+Launch the interactive TUI by running `ssher` with no arguments:
+```bash
+ssher
+```
+
+Select **Browse Servers** to open the in-terminal server browser.
+
+#### Browser Keybindings:
+- `j` / `k` or `↓` / `↑`: Move selection up/down
+- `Enter`: Connect to selected server
+- `a`: Add a new server
+- `e`: Edit selected server in place (prompts show current values in brackets)
+- `d`: Delete selected server (with y/n confirmation)
+- `/`: Filter servers by name or host (case-insensitive substring)
+  - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
+- `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
 
 ### Configure Terminal
 
@@ -174,11 +221,22 @@ ssher add <name> <host> <username> [OPTIONS]
   --port <port>                Default: 22
   --agent-forwarding           Enable SSH agent forwarding
 
+# Edit a server
+ssher edit <name> [OPTIONS]
+  --host <host>                 New server host
+  --username <username>         New SSH username
+  --port <port>                 New SSH port
+  --key <path>                  New SSH key path (switches to key auth)
+  --password                    Set new password (interactive prompt)
+  --agent-forwarding <true|false> Enable or disable SSH agent forwarding
+  --new-name <name>             New server identifier name
+
 # List servers
 ssher list
 
-# Connect to a server
-ssher connect <name>
+# Connect to a server (exact name or unambiguous partial match)
+ssher connect <name> [OPTIONS]
+  -c, --current                 Connect inline in current terminal
 
 # Remove a server
 ssher remove <name>

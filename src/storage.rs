@@ -1,5 +1,6 @@
 use crate::error::{Result, SshManagerError};
-use crate::models::{Config, Server, TerminalConfig};
+use crate::models::{AuthEdit, AuthMethod, Config, Server, ServerEdit, TerminalConfig};
+use crate::ssh::Ssh;
 use std::fs;
 use std::path::PathBuf;
 
@@ -151,6 +152,61 @@ impl Storage {
             return Err(SshManagerError::InvalidPort);
         }
         Ok(())
+    }
+
+    /// Execute server edit, handling validation, keyring side-effects, and config persistence.
+    pub fn execute_server_edit(
+        config: &mut Config,
+        target_name: &str,
+        edit: ServerEdit,
+        new_password: Option<String>,
+    ) -> Result<String> {
+        let idx = config
+            .servers
+            .iter()
+            .position(|s| s.name == target_name)
+            .ok_or_else(|| SshManagerError::ServerNotFound(target_name.to_string()))?;
+
+        let old_name = config.servers[idx].name.clone();
+        let old_auth = config.servers[idx].auth_method.clone();
+
+        let mut updated = config.servers[idx].clone();
+        edit.apply(&mut updated, config)?;
+        config.servers[idx] = updated;
+
+        let new_name = config.servers[idx].name.clone();
+
+        // Write new keyring entries first, but only delete old ones after the
+        // config is saved, so a failed save can't lose the stored password.
+        let mut stale_entry = None;
+        match &edit.auth {
+            Some(AuthEdit::Key(_)) => {
+                stale_entry = Some(old_name.clone());
+            }
+            Some(AuthEdit::Password) => {
+                let pw = new_password.ok_or_else(|| {
+                    SshManagerError::InvalidConfig("Password cannot be empty".to_string())
+                })?;
+                Ssh::store_password(&new_name, &pw)?;
+                if old_name != new_name {
+                    stale_entry = Some(old_name.clone());
+                }
+            }
+            None => {
+                if old_auth == AuthMethod::Password && old_name != new_name {
+                    let old_pw = Ssh::get_password(&old_name)?;
+                    Ssh::store_password(&new_name, &old_pw)?;
+                    stale_entry = Some(old_name.clone());
+                }
+            }
+        }
+
+        Self::save_config(config)?;
+        if let Some(name) = stale_entry {
+            let _ = Ssh::delete_password(&name);
+        }
+        println!("Server '{}' updated successfully!", new_name);
+        Ok(new_name)
     }
 }
 

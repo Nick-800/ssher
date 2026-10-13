@@ -57,6 +57,12 @@ pub enum SshManagerError {
 
     #[error("Failed to set up SSH_ASKPASS helper: {0}")]
     AskspassSetupFailed(String),
+
+    #[error("Ambiguous server name '{0}'. Matching candidates: {1}")]
+    AmbiguousServerName(String, String),
+
+    #[error("Nothing to change")]
+    NothingToChange,
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;

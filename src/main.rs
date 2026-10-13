@@ -46,6 +46,33 @@ enum Commands {
         agent_forwarding: bool,
     },
 
+    /// Modify a saved SSH server
+    Edit {
+        /// Server name to edit
+        name: String,
+        /// New server host (IP or domain)
+        #[arg(long)]
+        host: Option<String>,
+        /// New SSH username
+        #[arg(long)]
+        username: Option<String>,
+        /// New SSH port
+        #[arg(long)]
+        port: Option<u16>,
+        /// New SSH key file path
+        #[arg(long, conflicts_with = "password")]
+        key: Option<String>,
+        /// Set password authentication (interactive prompt)
+        #[arg(long, conflicts_with = "key")]
+        password: bool,
+        /// Enable or disable SSH agent forwarding
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        agent_forwarding: Option<bool>,
+        /// New server name (identifier)
+        #[arg(long)]
+        new_name: Option<String>,
+    },
+
     /// List all saved SSH servers
     List,
 
@@ -113,6 +140,27 @@ fn run(cli: Cli) -> Result<()> {
             password,
             agent_forwarding,
         } => add_server(name, host, username, port, key, password, agent_forwarding),
+        Commands::Edit {
+            name,
+            host,
+            username,
+            port,
+            key,
+            password,
+            agent_forwarding,
+            new_name,
+        } => edit_server(
+            name,
+            EditArgs {
+                host,
+                username,
+                port,
+                key,
+                password,
+                agent_forwarding,
+                new_name,
+            },
+        ),
         Commands::List => list_servers(),
         Commands::Connect { name, current } => connect_server(&name, current),
         Commands::Remove { name } => remove_server(&name),
@@ -223,12 +271,71 @@ fn list_servers() -> Result<()> {
     Ok(())
 }
 
+struct EditArgs {
+    host: Option<String>,
+    username: Option<String>,
+    port: Option<u16>,
+    key: Option<String>,
+    password: bool,
+    agent_forwarding: Option<bool>,
+    new_name: Option<String>,
+}
+
+fn edit_server(name: String, args: EditArgs) -> Result<()> {
+    if args.host.is_none()
+        && args.username.is_none()
+        && args.port.is_none()
+        && args.key.is_none()
+        && !args.password
+        && args.agent_forwarding.is_none()
+        && args.new_name.is_none()
+    {
+        return Err(error::SshManagerError::NothingToChange);
+    }
+
+    let mut config = Storage::load_config()?;
+
+    // Fail early if server doesn't exist
+    let _ = config
+        .find_server(&name)
+        .ok_or_else(|| error::SshManagerError::ServerNotFound(name.clone()))?;
+
+    let (auth, new_password) = if let Some(key_path) = args.key {
+        (Some(models::AuthEdit::Key(key_path)), None)
+    } else if args.password {
+        let display_name = args.new_name.as_deref().unwrap_or(&name);
+        print!("Enter password for server '{}': ", display_name);
+        io::stdout().flush()?;
+        let password = rpassword::read_password().map_err(|e| {
+            error::SshManagerError::InvalidConfig(format!("Failed to read password: {}", e))
+        })?;
+        if password.is_empty() {
+            return Err(error::SshManagerError::InvalidConfig(
+                "Password cannot be empty".to_string(),
+            ));
+        }
+        (Some(models::AuthEdit::Password), Some(password))
+    } else {
+        (None, None)
+    };
+
+    let edit = models::ServerEdit {
+        new_name: args.new_name,
+        host: args.host,
+        username: args.username,
+        port: args.port,
+        auth,
+        agent_forwarding: args.agent_forwarding,
+    };
+
+    Storage::execute_server_edit(&mut config, &name, edit, new_password)?;
+    Ok(())
+}
+
 fn connect_server(name: &str, force_current: bool) -> Result<()> {
     let config = Storage::load_config()?;
 
-    let server = config
-        .find_server(name)
-        .ok_or_else(|| error::SshManagerError::ServerNotFound(name.to_string()))?;
+    let server = config.resolve_server(name)?;
 
     // Get terminal to use
     let terminal_name = if force_current {
@@ -237,7 +344,7 @@ fn connect_server(name: &str, force_current: bool) -> Result<()> {
         Terminal::get_terminal_command(config.preferred_terminal.as_deref())?
     };
 
-    println!("Connecting to {}...", name);
+    println!("Connecting to {}...", server.name);
     Ssh::launch_connection(server, &terminal_name)?;
 
     Ok(())
@@ -274,4 +381,92 @@ fn set_terminal_config(terminal_name: &str) -> Result<()> {
 
     println!("Terminal preference set to '{}'", terminal_name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parse_edit_flags() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "edit",
+            "myserver",
+            "--host",
+            "example.com",
+            "--username",
+            "alice",
+            "--port",
+            "2222",
+            "--agent-forwarding",
+            "true",
+            "--new-name",
+            "newserver",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                name,
+                host,
+                username,
+                port,
+                key,
+                password,
+                agent_forwarding,
+                new_name,
+            } => {
+                assert_eq!(name, "myserver");
+                assert_eq!(host.as_deref(), Some("example.com"));
+                assert_eq!(username.as_deref(), Some("alice"));
+                assert_eq!(port, Some(2222));
+                assert_eq!(key, None);
+                assert!(!password);
+                assert_eq!(agent_forwarding, Some(true));
+                assert_eq!(new_name.as_deref(), Some("newserver"));
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_agent_forwarding_false() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "myserver", "--agent-forwarding", "false"])
+            .unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                agent_forwarding, ..
+            } => {
+                assert_eq!(agent_forwarding, Some(false));
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_key_and_password_conflict() {
+        let res = Cli::try_parse_from([
+            "ssher",
+            "edit",
+            "myserver",
+            "--key",
+            "/path/to/key",
+            "--password",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cli_connect_partial_name_arg() {
+        let cli = Cli::try_parse_from(["ssher", "connect", "prod"]).unwrap();
+        match cli.command {
+            Commands::Connect { name, current } => {
+                assert_eq!(name, "prod");
+                assert!(!current);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
 }

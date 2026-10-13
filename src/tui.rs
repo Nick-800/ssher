@@ -1,5 +1,5 @@
 use crate::error::{Result, SshManagerError};
-use crate::models::{AuthMethod, Server};
+use crate::models::{AuthEdit, AuthMethod, Config, Server, ServerEdit};
 use crate::ssh::Ssh;
 use crate::storage::Storage;
 use crate::terminal::Terminal;
@@ -20,12 +20,19 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MenuItem {
+    Browse,
     List,
     Add,
     Connect,
     Remove,
     Config,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BrowserMode {
+    Normal,
+    Filter,
 }
 
 pub struct Tui {
@@ -37,8 +44,9 @@ pub struct Tui {
 impl Tui {
     pub fn new() -> Self {
         Tui {
-            current_menu: MenuItem::List,
+            current_menu: MenuItem::Browse,
             menu_items: vec![
+                MenuItem::Browse,
                 MenuItem::List,
                 MenuItem::Add,
                 MenuItem::Connect,
@@ -212,6 +220,7 @@ impl Tui {
 
     fn get_menu_label(&self, item: MenuItem) -> String {
         match item {
+            MenuItem::Browse => "Browse Servers".to_string(),
             MenuItem::List => "List Servers".to_string(),
             MenuItem::Add => "Add New Server".to_string(),
             MenuItem::Connect => "Connect to Server".to_string(),
@@ -244,7 +253,26 @@ impl Tui {
         &mut self,
         terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        // Clear and hide UI before leaving
+        match self.current_menu {
+            MenuItem::Browse => self.run_browser(terminal)?,
+            MenuItem::List => Self::run_in_plain_screen(terminal, Self::show_list)?,
+            MenuItem::Add => Self::run_in_plain_screen(terminal, Self::show_add)?,
+            MenuItem::Connect => Self::run_in_plain_screen(terminal, Self::show_connect)?,
+            MenuItem::Remove => Self::run_in_plain_screen(terminal, Self::show_remove)?,
+            MenuItem::Config => Self::run_in_plain_screen(terminal, Self::show_config)?,
+            MenuItem::Exit => {}
+        }
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    fn run_in_plain_screen<F>(
+        terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
+        action: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
@@ -253,28 +281,570 @@ impl Tui {
             Show
         )?;
 
-        match self.current_menu {
-            MenuItem::List => self.show_list(),
-            MenuItem::Add => self.show_add(),
-            MenuItem::Connect => self.show_connect(),
-            MenuItem::Remove => self.show_remove(),
-            MenuItem::Config => self.show_config(),
-            MenuItem::Exit => Ok(()),
-        }?;
+        let action_result = action();
+        if let Err(e) = action_result {
+            println!("\nError: {}", e);
+        }
 
-        println!("\nPress Enter to return to menu...");
+        println!("\nPress Enter to return...");
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let _ = io::stdin().read_line(&mut input);
 
         enable_raw_mode()?;
         execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)?;
         terminal.clear()?;
-        self.needs_redraw = true;
 
         Ok(())
     }
 
-    fn show_list(&self) -> Result<()> {
+    fn connect_to_server(server: &Server, config: &Config) -> Result<()> {
+        println!("\n{}", "=".repeat(60));
+        println!("{:^60}", "CONNECT TO SERVER");
+        println!("{}", "=".repeat(60));
+
+        let terminal_name = Terminal::get_terminal_command(config.preferred_terminal.as_deref())?;
+
+        println!("\nConnecting to {}...", server.name);
+        Ssh::launch_connection(server, &terminal_name)?;
+        Ok(())
+    }
+
+    fn prompt_delete_server(server_name: &str) -> Result<()> {
+        println!("\n{}", "=".repeat(60));
+        println!("{:^60}", "REMOVE SERVER");
+        println!("{}", "=".repeat(60));
+
+        print!(
+            "\nAre you sure you want to remove '{}'? (y/n): ",
+            server_name
+        );
+        io::stdout().flush()?;
+        let mut confirm = String::new();
+        io::stdin().read_line(&mut confirm)?;
+
+        if confirm.trim().to_lowercase() != "y" {
+            println!("Cancelled.");
+            return Ok(());
+        }
+
+        let mut config = Storage::load_config()?;
+        config.servers.retain(|s| s.name != server_name);
+        Storage::save_config(&config)?;
+        let _ = Ssh::delete_password(server_name);
+
+        println!("\n✓ Server '{}' removed successfully!", server_name);
+        Ok(())
+    }
+
+    fn prompt_edit_server(server: &Server) -> Result<()> {
+        println!("\n{}", "=".repeat(60));
+        println!("{:^60}", format!("EDIT SERVER: {}", server.name));
+        println!("{}", "=".repeat(60));
+
+        print!("\nServer name [{}]: ", server.name);
+        io::stdout().flush()?;
+        let mut new_name = String::new();
+        io::stdin().read_line(&mut new_name)?;
+        let new_name = if new_name.trim().is_empty() {
+            None
+        } else {
+            Some(new_name.trim().to_string())
+        };
+
+        print!("Host (IP or domain) [{}]: ", server.host);
+        io::stdout().flush()?;
+        let mut host = String::new();
+        io::stdin().read_line(&mut host)?;
+        let host = if host.trim().is_empty() {
+            None
+        } else {
+            Some(host.trim().to_string())
+        };
+
+        print!("Username [{}]: ", server.username);
+        io::stdout().flush()?;
+        let mut username = String::new();
+        io::stdin().read_line(&mut username)?;
+        let username = if username.trim().is_empty() {
+            None
+        } else {
+            Some(username.trim().to_string())
+        };
+
+        print!("Port [{}]: ", server.port);
+        io::stdout().flush()?;
+        let mut port_str = String::new();
+        io::stdin().read_line(&mut port_str)?;
+        let port = if port_str.trim().is_empty() {
+            None
+        } else {
+            let p: u16 = port_str
+                .trim()
+                .parse()
+                .map_err(|_| SshManagerError::InvalidPort)?;
+            Some(p)
+        };
+
+        let current_auth_desc = match server.auth_method {
+            AuthMethod::Key => "1 (Key)",
+            AuthMethod::Password => "2 (Password)",
+        };
+        println!("\nAuthentication method [current: {}]:", current_auth_desc);
+        println!("1. SSH Key");
+        println!("2. Password");
+        print!("Choose (1 or 2, press Enter to keep current): ");
+        io::stdout().flush()?;
+        let mut auth_choice = String::new();
+        io::stdin().read_line(&mut auth_choice)?;
+        let auth_choice = auth_choice.trim();
+
+        let (auth, new_password) = match auth_choice {
+            "1" => {
+                let current_key = server.key_path.as_deref().unwrap_or("");
+                if current_key.is_empty() {
+                    print!("SSH key path: ");
+                } else {
+                    print!("SSH key path [{}]: ", current_key);
+                }
+                io::stdout().flush()?;
+                let mut key_path = String::new();
+                io::stdin().read_line(&mut key_path)?;
+                let key_path = key_path.trim();
+                let chosen_key = if key_path.is_empty() {
+                    if current_key.is_empty() {
+                        return Err(SshManagerError::InvalidConfig(
+                            "SSH key path cannot be empty".to_string(),
+                        ));
+                    }
+                    current_key.to_string()
+                } else {
+                    key_path.to_string()
+                };
+                (Some(AuthEdit::Key(chosen_key)), None)
+            }
+            "2" => {
+                if server.auth_method == AuthMethod::Password {
+                    println!("\nEnter new password (press Enter to keep current):");
+                    let pw = rpassword::read_password().map_err(|e| {
+                        SshManagerError::InvalidConfig(format!("Failed to read password: {}", e))
+                    })?;
+                    if pw.is_empty() {
+                        (None, None)
+                    } else {
+                        (Some(AuthEdit::Password), Some(pw))
+                    }
+                } else {
+                    println!("\nEnter password:");
+                    let pw = rpassword::read_password().map_err(|e| {
+                        SshManagerError::InvalidConfig(format!("Failed to read password: {}", e))
+                    })?;
+                    if pw.is_empty() {
+                        return Err(SshManagerError::InvalidConfig(
+                            "Password cannot be empty".to_string(),
+                        ));
+                    }
+                    (Some(AuthEdit::Password), Some(pw))
+                }
+            }
+            "" => (None, None),
+            _ => {
+                return Err(SshManagerError::InvalidConfig("Invalid choice".to_string()));
+            }
+        };
+
+        let current_af_desc = if server.use_agent_forwarding {
+            "y"
+        } else {
+            "n"
+        };
+        print!("Enable agent forwarding? (y/n) [{}]: ", current_af_desc);
+        io::stdout().flush()?;
+        let mut af_choice = String::new();
+        io::stdin().read_line(&mut af_choice)?;
+        let af_choice = af_choice.trim().to_lowercase();
+        let agent_forwarding = if af_choice.is_empty() {
+            None
+        } else {
+            Some(af_choice == "y" || af_choice == "yes")
+        };
+
+        let edit = ServerEdit {
+            new_name,
+            host,
+            username,
+            port,
+            auth,
+            agent_forwarding,
+        };
+
+        let mut config = Storage::load_config()?;
+        Storage::execute_server_edit(&mut config, &server.name, edit, new_password)?;
+        Ok(())
+    }
+
+    fn run_browser(
+        &mut self,
+        terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        let mut config = Storage::load_config()?;
+        let mut selected_index: usize = 0;
+        let mut filter_query = String::new();
+        let mut mode = BrowserMode::Normal;
+        let mut needs_browser_redraw = true;
+
+        loop {
+            let filtered_indices =
+                crate::models::filter_server_indices(&config.servers, &filter_query);
+
+            if filtered_indices.is_empty() {
+                selected_index = 0;
+            } else if selected_index >= filtered_indices.len() {
+                selected_index = filtered_indices.len() - 1;
+            }
+
+            let mut had_event = false;
+            if event::poll(Duration::from_millis(33))? {
+                had_event = true;
+                match event::read()? {
+                    Event::Key(key) => match mode {
+                        BrowserMode::Normal => match key.code {
+                            KeyCode::Down | KeyCode::Char('j')
+                                if !filtered_indices.is_empty()
+                                    && selected_index + 1 < filtered_indices.len() =>
+                            {
+                                selected_index += 1;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') if selected_index > 0 => {
+                                selected_index -= 1;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Enter if !filtered_indices.is_empty() => {
+                                let server =
+                                    config.servers[filtered_indices[selected_index]].clone();
+                                let cfg_clone = config.clone();
+                                Self::run_in_plain_screen(terminal, || {
+                                    Self::connect_to_server(&server, &cfg_clone)
+                                })?;
+                                config = Storage::load_config()?;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char('a') => {
+                                Self::run_in_plain_screen(terminal, Self::show_add)?;
+                                config = Storage::load_config()?;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char('e') if !filtered_indices.is_empty() => {
+                                let server =
+                                    config.servers[filtered_indices[selected_index]].clone();
+                                Self::run_in_plain_screen(terminal, || {
+                                    Self::prompt_edit_server(&server)
+                                })?;
+                                config = Storage::load_config()?;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char('d') if !filtered_indices.is_empty() => {
+                                let server_name = config.servers[filtered_indices[selected_index]]
+                                    .name
+                                    .clone();
+                                Self::run_in_plain_screen(terminal, || {
+                                    Self::prompt_delete_server(&server_name)
+                                })?;
+                                config = Storage::load_config()?;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char('/') => {
+                                mode = BrowserMode::Filter;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Esc => {
+                                if !filter_query.is_empty() {
+                                    filter_query.clear();
+                                    needs_browser_redraw = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            KeyCode::Char('q') => {
+                                break;
+                            }
+                            _ => {}
+                        },
+                        BrowserMode::Filter => match key.code {
+                            KeyCode::Enter => {
+                                mode = BrowserMode::Normal;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Esc => {
+                                filter_query.clear();
+                                mode = BrowserMode::Normal;
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                filter_query.pop();
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                filter_query.push(c);
+                                needs_browser_redraw = true;
+                            }
+                            _ => {}
+                        },
+                    },
+                    Event::Resize(_, _) => {
+                        needs_browser_redraw = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if had_event || needs_browser_redraw {
+                terminal.draw(|f| {
+                    Self::draw_browser(
+                        f,
+                        &config,
+                        &filtered_indices,
+                        selected_index,
+                        &filter_query,
+                        mode,
+                    );
+                })?;
+                needs_browser_redraw = false;
+            }
+        }
+
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    fn draw_browser(
+        f: &mut ratatui::Frame,
+        config: &Config,
+        filtered_indices: &[usize],
+        selected_index: usize,
+        filter_query: &str,
+        mode: BrowserMode,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(3),
+            ])
+            .split(f.size());
+
+        // Header
+        let title = if filter_query.is_empty() {
+            format!(
+                "SSHER SERVER BROWSER  •  Servers ({})",
+                config.servers.len()
+            )
+        } else {
+            format!(
+                "SSHER SERVER BROWSER  •  Servers (matching {} of {})",
+                filtered_indices.len(),
+                config.servers.len()
+            )
+        };
+        let header = Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .block(Block::default().borders(Borders::ALL))
+        .alignment(Alignment::Center);
+        f.render_widget(header, chunks[0]);
+
+        // Server list
+        if config.servers.is_empty() {
+            let empty_msg = Paragraph::new("No servers configured. Press a to add.")
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().title("Servers").borders(Borders::ALL))
+                .alignment(Alignment::Center);
+            f.render_widget(empty_msg, chunks[1]);
+        } else if filtered_indices.is_empty() {
+            let no_match_msg = Paragraph::new(format!(
+                "No servers match filter '{}'. Press Esc to clear filter.",
+                filter_query
+            ))
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().title("Servers").borders(Borders::ALL))
+            .alignment(Alignment::Center);
+            f.render_widget(no_match_msg, chunks[1]);
+        } else {
+            let col_header = format!(
+                "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
+                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW"
+            );
+            let separator = format!("  {}", "─".repeat(89));
+
+            let mut items = Vec::new();
+            items.push(
+                ListItem::new(col_header).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+            items.push(ListItem::new(separator).style(Style::default().fg(Color::DarkGray)));
+
+            for (view_idx, &real_idx) in filtered_indices.iter().enumerate() {
+                let s = &config.servers[real_idx];
+                let auth_str = match s.auth_method {
+                    AuthMethod::Key => "key",
+                    AuthMethod::Password => "password",
+                };
+                let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
+
+                if view_idx == selected_index {
+                    let line = format!(
+                        "▶ {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str
+                    );
+                    items.push(
+                        ListItem::new(line).style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    );
+                } else {
+                    let line = format!(
+                        "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<8}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str
+                    );
+                    items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
+                }
+            }
+
+            let mut list_state = ratatui::widgets::ListState::default();
+            list_state.select(Some(selected_index + 2));
+            let list_widget =
+                List::new(items).block(Block::default().title("Servers").borders(Borders::ALL));
+            f.render_stateful_widget(list_widget, chunks[1], &mut list_state);
+        }
+
+        // Footer
+        let footer_widget = match mode {
+            BrowserMode::Normal => {
+                let mut spans = Vec::new();
+                if !filter_query.is_empty() {
+                    spans.push(Span::styled(
+                        "Filter: ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!("\"{}\" • ", filter_query),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                spans.extend([
+                    Span::styled(
+                        "j/k/↑/↓",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Move • "),
+                    Span::styled(
+                        "Enter",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Connect • "),
+                    Span::styled(
+                        "a",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Add • "),
+                    Span::styled(
+                        "e",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Edit • "),
+                    Span::styled(
+                        "d",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Delete • "),
+                    Span::styled(
+                        "/",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Filter • "),
+                    Span::styled(
+                        "Esc/q",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Back"),
+                ]);
+                Paragraph::new(Line::from(spans))
+                    .block(Block::default().borders(Borders::ALL))
+                    .alignment(Alignment::Center)
+            }
+            BrowserMode::Filter => {
+                let spans = vec![
+                    Span::styled(
+                        "Filter: ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        filter_query,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                    Span::raw("   "),
+                    Span::styled(
+                        "Enter",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Apply • "),
+                    Span::styled(
+                        "Esc",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Clear • "),
+                    Span::styled(
+                        "Backspace",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Delete"),
+                ];
+                Paragraph::new(Line::from(spans))
+                    .block(Block::default().borders(Borders::ALL))
+                    .alignment(Alignment::Center)
+            }
+        };
+        f.render_widget(footer_widget, chunks[2]);
+    }
+
+    fn show_list() -> Result<()> {
         let config = crate::storage::Storage::load_config()?;
 
         println!("\n{}", "=".repeat(95));
@@ -313,7 +883,7 @@ impl Tui {
         Ok(())
     }
 
-    fn show_add(&self) -> Result<()> {
+    fn show_add() -> Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "ADD NEW SERVER");
         println!("{}", "=".repeat(60));
@@ -404,7 +974,7 @@ impl Tui {
         Ok(())
     }
 
-    fn show_connect(&self) -> Result<()> {
+    fn show_connect() -> Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "CONNECT TO SERVER");
         println!("{}", "=".repeat(60));
@@ -441,7 +1011,7 @@ impl Tui {
         Ok(())
     }
 
-    fn show_remove(&self) -> Result<()> {
+    fn show_remove() -> Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "REMOVE SERVER");
         println!("{}", "=".repeat(60));
@@ -491,7 +1061,7 @@ impl Tui {
         Ok(())
     }
 
-    fn show_config(&self) -> Result<()> {
+    fn show_config() -> Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "CONFIGURE SETTINGS");
         println!("{}", "=".repeat(60));
