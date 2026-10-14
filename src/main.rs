@@ -104,6 +104,19 @@ enum Commands {
         name: String,
     },
 
+    /// Import SSH servers from an ssh_config file
+    Import {
+        /// Path to SSH configuration file (default: ~/.ssh/config)
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+        /// Preview what would be imported without modifying configuration
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip hosts that collide with existing server names
+        #[arg(long)]
+        skip_existing: bool,
+    },
+
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -207,6 +220,15 @@ fn run(cli: Cli) -> Result<()> {
         Commands::List { tag } => list_servers(&tag),
         Commands::Connect { name, current } => connect_server(&name, current),
         Commands::Remove { name } => remove_server(&name),
+        Commands::Import {
+            file,
+            dry_run,
+            skip_existing,
+        } => import_servers(ImportArgs {
+            file,
+            dry_run,
+            skip_existing,
+        }),
         Commands::Completions { shell } => generate_completions(shell),
         Commands::CompleteServers => complete_servers(),
         Commands::CompleteTags => complete_tags(),
@@ -469,6 +491,128 @@ fn set_terminal_config(terminal_name: &str) -> Result<()> {
     Ok(())
 }
 
+struct ImportArgs {
+    file: Option<std::path::PathBuf>,
+    dry_run: bool,
+    skip_existing: bool,
+}
+
+fn expand_tilde_path(p: &std::path::Path) -> Result<std::path::PathBuf> {
+    let s = p.to_string_lossy();
+    if s == "~" {
+        dirs::home_dir().ok_or_else(|| {
+            error::SshManagerError::ConfigDirError(
+                "Could not determine home directory. $HOME not set?".to_string(),
+            )
+        })
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            error::SshManagerError::ConfigDirError(
+                "Could not determine home directory. $HOME not set?".to_string(),
+            )
+        })?;
+        Ok(home.join(rest))
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
+fn import_servers(args: ImportArgs) -> Result<()> {
+    let file_path = match args.file {
+        Some(p) => expand_tilde_path(&p)?,
+        None => {
+            let home = dirs::home_dir().ok_or_else(|| {
+                error::SshManagerError::ConfigDirError(
+                    "Could not determine home directory. $HOME not set?".to_string(),
+                )
+            })?;
+            home.join(".ssh").join("config")
+        }
+    };
+
+    if !file_path.exists() {
+        return Err(error::SshManagerError::InvalidConfig(format!(
+            "SSH config file not found: {}",
+            file_path.display()
+        )));
+    }
+
+    let content = std::fs::read_to_string(&file_path)?;
+    let home_dir = dirs::home_dir();
+    let home_str = home_dir.as_ref().and_then(|p| p.to_str());
+
+    let parse_res = models::parse_ssh_config_detailed(&content, home_str);
+
+    for warn in &parse_res.warnings {
+        eprintln!("Warning: {}", warn);
+    }
+
+    let mut config = Storage::load_config()?;
+    let env_user = std::env::var("USER").ok();
+
+    let map_res = models::filter_and_map_imported_hosts(
+        &config,
+        parse_res.hosts,
+        env_user.as_deref(),
+        |key_path| Storage::validate_key_path(key_path).is_ok(),
+    );
+
+    let mut all_skipped = parse_res.skipped;
+    all_skipped.extend(map_res.skipped);
+
+    if args.dry_run {
+        println!("Dry run mode: no changes written.");
+        for s in &map_res.to_import {
+            println!(
+                "Would import: '{}' ({}@{}:{}, key: {})",
+                s.name,
+                s.username,
+                s.host,
+                s.port,
+                s.key_path.as_deref().unwrap_or("none")
+            );
+        }
+        for (name, reason) in &all_skipped {
+            println!("Would skip: '{}' ({})", name, reason);
+        }
+        println!(
+            "Summary: {} would be imported, {} would be skipped",
+            map_res.to_import.len(),
+            all_skipped.len()
+        );
+        return Ok(());
+    }
+
+    for (name, reason) in &all_skipped {
+        if args.skip_existing && reason == "Server already exists" {
+            eprintln!(
+                "Warning: skipping '{}' (--skip-existing): server already exists",
+                name
+            );
+        } else {
+            eprintln!("Warning: skipping '{}': {}", name, reason);
+        }
+    }
+
+    let imported_count = map_res.to_import.len();
+    config.servers.extend(map_res.to_import);
+    Storage::save_config(&config)?;
+
+    println!(
+        "Summary: imported {}, skipped {}",
+        imported_count,
+        all_skipped.len()
+    );
+    if !all_skipped.is_empty() {
+        println!("Skipped hosts:");
+        for (name, reason) in &all_skipped {
+            println!("  - {}: {}", name, reason);
+        }
+    }
+
+    Ok(())
+}
+
 pub fn generate_completion_script(shell: clap_complete::Shell) -> String {
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
@@ -505,7 +649,7 @@ _ssher_complete() {
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
-            add|list|completions|config|help)
+            add|list|import|completions|config|help)
                 break
                 ;;
         esac
@@ -826,5 +970,47 @@ mod tests {
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
+    }
+
+    #[test]
+    fn cli_parse_import_defaults() {
+        let cli = Cli::try_parse_from(["ssher", "import"]).unwrap();
+        match cli.command {
+            Commands::Import {
+                file,
+                dry_run,
+                skip_existing,
+            } => {
+                assert_eq!(file, None);
+                assert!(!dry_run);
+                assert!(!skip_existing);
+            }
+            _ => panic!("expected Commands::Import"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_import_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "import",
+            "--file",
+            "/tmp/custom_config",
+            "--dry-run",
+            "--skip-existing",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Import {
+                file,
+                dry_run,
+                skip_existing,
+            } => {
+                assert_eq!(file, Some(std::path::PathBuf::from("/tmp/custom_config")));
+                assert!(dry_run);
+                assert!(skip_existing);
+            }
+            _ => panic!("expected Commands::Import"),
+        }
     }
 }

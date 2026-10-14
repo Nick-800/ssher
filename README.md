@@ -10,6 +10,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
 - **SSH Options**: Support for custom ports, SSH agent forwarding, and identity files
+- **SSH Config Import**: Import host configurations from `~/.ssh/config` or custom files with dry-run support
 - **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name completion
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
@@ -141,6 +142,26 @@ ssher remove myserver
 ```
 
 This will remove the server configuration and clean up any stored password from the keyring.
+
+### Import from SSH Config
+
+Import host configurations from `~/.ssh/config` (or a specified file):
+
+```bash
+# Import from default ~/.ssh/config
+ssher import
+
+# Preview import without saving changes
+ssher import --dry-run
+
+# Import from a custom config file
+ssher import --file /path/to/ssh_config
+
+# Skip existing servers without errors
+ssher import --skip-existing
+```
+
+The import command parses `Host` blocks with key-based authentication (`IdentityFile`), honoring `HostName`, `User`, `Port`, and `ForwardAgent`. Host entries without an `IdentityFile` are skipped with a warning.
 
 ### Interactive TUI & Server Browser
 
@@ -396,6 +417,12 @@ ssher connect <name> [OPTIONS]
 
 # Remove a server
 ssher remove <name>
+
+# Import servers from SSH config
+ssher import [OPTIONS]
+  -f, --file <path>             Path to SSH config file (default: ~/.ssh/config)
+  --dry-run                     Preview import without modifying configuration
+  --skip-existing               Skip hosts that collide with existing server names
 
 # Configure settings
 ssher config terminal <terminal-name>

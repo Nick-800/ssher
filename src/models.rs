@@ -10,7 +10,7 @@ pub enum AuthMethod {
     Password,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Server {
     pub name: String,
     pub host: String,
@@ -261,6 +261,388 @@ pub fn format_tag_completions(servers: &[Server]) -> String {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalConfig {
     pub terminal: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedHost {
+    pub name: String,
+    pub host: String,
+    pub username: Option<String>,
+    pub port: u16,
+    pub identity_file: Option<String>,
+    pub forward_agent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SshConfigParseResult {
+    pub hosts: Vec<ImportedHost>,
+    pub skipped: Vec<(String, String)>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportResult {
+    pub to_import: Vec<Server>,
+    pub skipped: Vec<(String, String)>,
+}
+
+fn strip_comment(line: &str) -> &str {
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+    let mut escape = false;
+    for (idx, ch) in line.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+        if in_quote {
+            if ch == quote_char {
+                in_quote = false;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = true;
+            quote_char = ch;
+        } else if ch == '#' {
+            return &line[..idx];
+        }
+    }
+    line
+}
+
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let delim_pos = trimmed.find(|c: char| c.is_whitespace() || c == '=')?;
+    let key = &trimmed[..delim_pos];
+    let rest = trimmed[delim_pos..].trim_start();
+    let value = if let Some(stripped) = rest.strip_prefix('=') {
+        stripped.trim_start()
+    } else {
+        rest
+    };
+    Some((key, value.trim()))
+}
+
+fn parse_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+    let mut escape = false;
+
+    for ch in s.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+        if in_quote {
+            if ch == quote_char {
+                in_quote = false;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = true;
+            quote_char = ch;
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_wildcard_or_negated(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('!')
+}
+
+fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    if let Some(home_path) = home {
+        let home_clean = home_path.trim_end_matches('/');
+        if path == "~" {
+            home_clean.to_string()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            format!("{}/{}", home_clean, rest)
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+/// Pure parser for SSH config content.
+#[allow(dead_code)]
+pub fn parse_ssh_config(content: &str, home: Option<&str>) -> Vec<ImportedHost> {
+    parse_ssh_config_detailed(content, home).hosts
+}
+
+/// Parse SSH config content with full details including skipped hosts and warnings.
+pub fn parse_ssh_config_detailed(content: &str, home: Option<&str>) -> SshConfigParseResult {
+    let mut hosts = Vec::new();
+    let mut skipped = Vec::new();
+    let mut warnings = Vec::new();
+    let mut warned_include = false;
+    let mut warned_match = false;
+
+    struct CurrentBlock {
+        aliases: Vec<String>,
+        hostname: Option<String>,
+        user: Option<String>,
+        port: Option<u16>,
+        identity_file: Option<String>,
+        forward_agent: Option<bool>,
+    }
+
+    let mut current_block: Option<CurrentBlock> = None;
+    let mut in_match_block = false;
+
+    let finalize_block = |block: CurrentBlock,
+                          hosts: &mut Vec<ImportedHost>,
+                          skipped: &mut Vec<(String, String)>| {
+        for alias in block.aliases {
+            match &block.identity_file {
+                Some(key) => {
+                    hosts.push(ImportedHost {
+                        name: alias.clone(),
+                        host: block.hostname.clone().unwrap_or_else(|| alias.clone()),
+                        username: block.user.clone(),
+                        port: block.port.unwrap_or(22),
+                        identity_file: Some(key.clone()),
+                        forward_agent: block.forward_agent.unwrap_or(false),
+                    });
+                }
+                None => {
+                    skipped.push((
+                        alias,
+                        "no IdentityFile; add manually with --password".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    for raw_line in content.lines() {
+        let line_without_comment = strip_comment(raw_line).trim();
+        if line_without_comment.is_empty() {
+            continue;
+        }
+
+        let Some((key, val)) = split_key_value(line_without_comment) else {
+            continue;
+        };
+
+        let key_lower = key.to_lowercase();
+        match key_lower.as_str() {
+            "include" => {
+                if !warned_include {
+                    warnings.push("Include directive is not followed".to_string());
+                    warned_include = true;
+                }
+            }
+            "match" => {
+                if !warned_match {
+                    warnings.push("Match directive is not followed".to_string());
+                    warned_match = true;
+                }
+                if let Some(b) = current_block.take() {
+                    finalize_block(b, &mut hosts, &mut skipped);
+                }
+                in_match_block = true;
+            }
+            "host" => {
+                if let Some(b) = current_block.take() {
+                    finalize_block(b, &mut hosts, &mut skipped);
+                }
+                in_match_block = false;
+
+                let patterns = parse_tokens(val);
+                let concrete_aliases: Vec<String> = patterns
+                    .into_iter()
+                    .filter(|p| !is_wildcard_or_negated(p))
+                    .collect();
+
+                current_block = Some(CurrentBlock {
+                    aliases: concrete_aliases,
+                    hostname: None,
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    forward_agent: None,
+                });
+            }
+            _ => {
+                if in_match_block {
+                    continue;
+                }
+                if let Some(block) = current_block.as_mut() {
+                    match key_lower.as_str() {
+                        "hostname" if block.hostname.is_none() => {
+                            block.hostname = Some(strip_quotes(val).to_string());
+                        }
+                        "user" if block.user.is_none() => {
+                            block.user = Some(strip_quotes(val).to_string());
+                        }
+                        "port" if block.port.is_none() => {
+                            let unquoted = strip_quotes(val);
+                            match unquoted.parse::<u16>() {
+                                Ok(p) if p > 0 => {
+                                    block.port = Some(p);
+                                }
+                                _ => {
+                                    warnings.push(format!(
+                                        "Invalid port '{}', defaulting to 22",
+                                        unquoted
+                                    ));
+                                    block.port = Some(22);
+                                }
+                            }
+                        }
+                        "identityfile" if block.identity_file.is_none() => {
+                            let unquoted = strip_quotes(val);
+                            let expanded = expand_tilde(unquoted, home);
+                            block.identity_file = Some(expanded);
+                        }
+                        "forwardagent" if block.forward_agent.is_none() => {
+                            let unquoted = strip_quotes(val).to_lowercase();
+                            match unquoted.as_str() {
+                                "yes" | "true" => block.forward_agent = Some(true),
+                                "no" | "false" => block.forward_agent = Some(false),
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            // unknown keywords ignored
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(b) = current_block.take() {
+        finalize_block(b, &mut hosts, &mut skipped);
+    }
+
+    SshConfigParseResult {
+        hosts,
+        skipped,
+        warnings,
+    }
+}
+
+/// Pure helper to map and validate imported hosts against existing config.
+pub fn filter_and_map_imported_hosts(
+    existing_config: &Config,
+    imported_hosts: Vec<ImportedHost>,
+    default_user: Option<&str>,
+    validate_key_exists: impl Fn(&str) -> bool,
+) -> ImportResult {
+    let mut to_import = Vec::new();
+    let mut skipped = Vec::new();
+
+    for host in imported_hosts {
+        if let Err(e) = Storage::validate_server_name(&host.name) {
+            skipped.push((host.name.clone(), format!("Invalid server name: {}", e)));
+            continue;
+        }
+
+        let exists_in_config = !Storage::server_name_is_unique(existing_config, &host.name, None);
+        let exists_in_batch = to_import.iter().any(|s: &Server| s.name == host.name);
+        if exists_in_config || exists_in_batch {
+            skipped.push((host.name.clone(), "Server already exists".to_string()));
+            continue;
+        }
+
+        if let Err(e) = Storage::validate_host(&host.host) {
+            skipped.push((host.name.clone(), format!("Invalid host: {}", e)));
+            continue;
+        }
+
+        let username = match &host.username {
+            Some(u) if !u.is_empty() => u.clone(),
+            _ => match default_user {
+                Some(u) if !u.is_empty() => u.to_string(),
+                _ => {
+                    skipped.push((
+                        host.name.clone(),
+                        "Username cannot be empty and $USER is not set".to_string(),
+                    ));
+                    continue;
+                }
+            },
+        };
+        if let Err(e) = Storage::validate_username(&username) {
+            skipped.push((host.name.clone(), format!("Invalid username: {}", e)));
+            continue;
+        }
+
+        if let Err(e) = Storage::validate_port(host.port) {
+            skipped.push((host.name.clone(), format!("Invalid port: {}", e)));
+            continue;
+        }
+
+        let key_path = match &host.identity_file {
+            Some(k) => k.clone(),
+            None => {
+                skipped.push((
+                    host.name.clone(),
+                    "no IdentityFile; add manually with --password".to_string(),
+                ));
+                continue;
+            }
+        };
+
+        if !validate_key_exists(&key_path) {
+            skipped.push((
+                host.name.clone(),
+                format!("SSH key file not found: {}", key_path),
+            ));
+            continue;
+        }
+
+        let mut server = Server::new(
+            host.name.clone(),
+            host.host.clone(),
+            username,
+            host.port,
+            AuthMethod::Key,
+            Some(key_path),
+        );
+        server.use_agent_forwarding = host.forward_agent;
+        to_import.push(server);
+    }
+
+    ImportResult { to_import, skipped }
 }
 
 #[cfg(test)]
@@ -719,5 +1101,367 @@ mod tests {
         s3.tags = vec![];
         let servers = vec![s1, s2, s3];
         assert_eq!(format_tag_completions(&servers), "api\nprod\nweb\n");
+    }
+
+    #[test]
+    fn parse_ssh_config_basic_host() {
+        let input = r#"
+Host prod
+    HostName 10.0.0.1
+    User alice
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+    ForwardAgent yes
+"#;
+        let hosts = parse_ssh_config(input, Some("/home/alice"));
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "prod");
+        assert_eq!(hosts[0].host, "10.0.0.1");
+        assert_eq!(hosts[0].username.as_deref(), Some("alice"));
+        assert_eq!(hosts[0].port, 2222);
+        assert_eq!(
+            hosts[0].identity_file.as_deref(),
+            Some("/home/alice/.ssh/id_ed25519")
+        );
+        assert!(hosts[0].forward_agent);
+    }
+
+    #[test]
+    fn parse_ssh_config_multiple_patterns() {
+        let input = r#"
+Host web1 web2
+    HostName cluster.internal
+    IdentityFile /keys/deploy
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].name, "web1");
+        assert_eq!(hosts[0].host, "cluster.internal");
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("/keys/deploy"));
+        assert_eq!(hosts[1].name, "web2");
+        assert_eq!(hosts[1].host, "cluster.internal");
+        assert_eq!(hosts[1].identity_file.as_deref(), Some("/keys/deploy"));
+    }
+
+    #[test]
+    fn parse_ssh_config_wildcard_skipped() {
+        let input = r#"
+Host *.example.com
+    IdentityFile /keys/star
+
+Host host?
+    IdentityFile /keys/q
+
+Host !badhost goodhost
+    IdentityFile /keys/good
+
+Host *
+    IdentityFile /keys/default
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "goodhost");
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("/keys/good"));
+    }
+
+    #[test]
+    fn parse_ssh_config_key_value_form() {
+        let input = r#"
+Host=alpha
+HostName=alpha.example.com
+User=deployer
+Port=2201
+IdentityFile=/keys/alpha
+ForwardAgent=yes
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "alpha");
+        assert_eq!(hosts[0].host, "alpha.example.com");
+        assert_eq!(hosts[0].username.as_deref(), Some("deployer"));
+        assert_eq!(hosts[0].port, 2201);
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("/keys/alpha"));
+        assert!(hosts[0].forward_agent);
+    }
+
+    #[test]
+    fn parse_ssh_config_quotes() {
+        let input = r#"
+Host "quoted-host"
+    HostName "quoted.net"
+    User "john doe"
+    IdentityFile "/path with spaces/id_rsa"
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "quoted-host");
+        assert_eq!(hosts[0].host, "quoted.net");
+        assert_eq!(hosts[0].username.as_deref(), Some("john doe"));
+        assert_eq!(
+            hosts[0].identity_file.as_deref(),
+            Some("/path with spaces/id_rsa")
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_missing_identity_file_skipped() {
+        let input = r#"
+Host no-key
+    HostName nokey.example.com
+    User alice
+
+Host has-key
+    HostName haskey.example.com
+    IdentityFile /keys/id_rsa
+"#;
+        let res = parse_ssh_config_detailed(input, None);
+        assert_eq!(res.hosts.len(), 1);
+        assert_eq!(res.hosts[0].name, "has-key");
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(res.skipped[0].0, "no-key");
+        assert!(res.skipped[0]
+            .1
+            .contains("no IdentityFile; add manually with --password"));
+    }
+
+    #[test]
+    fn parse_ssh_config_tilde_expansion() {
+        let input = r#"
+Host home-test
+    IdentityFile ~/.ssh/custom_key
+"#;
+        let hosts_expanded = parse_ssh_config(input, Some("/fake/home/user"));
+        assert_eq!(hosts_expanded.len(), 1);
+        assert_eq!(
+            hosts_expanded[0].identity_file.as_deref(),
+            Some("/fake/home/user/.ssh/custom_key")
+        );
+
+        let hosts_unexpanded = parse_ssh_config(input, None);
+        assert_eq!(hosts_unexpanded.len(), 1);
+        assert_eq!(
+            hosts_unexpanded[0].identity_file.as_deref(),
+            Some("~/.ssh/custom_key")
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_invalid_port() {
+        let input = r#"
+Host bad-port-alpha
+    Port notanumber
+    IdentityFile /keys/k1
+
+Host bad-port-zero
+    Port 0
+    IdentityFile /keys/k2
+
+Host bad-port-overflow
+    Port 70000
+    IdentityFile /keys/k3
+"#;
+        let res = parse_ssh_config_detailed(input, None);
+        assert_eq!(res.hosts.len(), 3);
+        assert_eq!(res.hosts[0].port, 22);
+        assert_eq!(res.hosts[1].port, 22);
+        assert_eq!(res.hosts[2].port, 22);
+        assert_eq!(res.warnings.len(), 3);
+    }
+
+    #[test]
+    fn parse_ssh_config_comments() {
+        let input = r#"
+# Global comment
+# Another comment
+Host myhost # inline comment after host
+    # Indented comment
+    HostName 10.1.1.1 # inline comment on hostname
+    Port 22 # default port
+    IdentityFile /keys/mykey
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "myhost");
+        assert_eq!(hosts[0].host, "10.1.1.1");
+        assert_eq!(hosts[0].port, 22);
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("/keys/mykey"));
+    }
+
+    #[test]
+    fn parse_ssh_config_unknown_keywords_ignored() {
+        let input = r#"
+Host complex
+    ServerAliveInterval 30
+    StrictHostKeyChecking no
+    ProxyJump bastion.example.com
+    UserKnownHostsFile /dev/null
+    IdentityFile /keys/id_rsa
+"#;
+        let hosts = parse_ssh_config(input, None);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "complex");
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("/keys/id_rsa"));
+    }
+
+    #[test]
+    fn parse_ssh_config_include_and_match_warned() {
+        let input = r#"
+Include /etc/ssh/extra_config
+Include /etc/ssh/more_config
+Host srv
+    IdentityFile /keys/id_rsa
+Match host complex
+    Port 2200
+Match host other
+    Port 2201
+"#;
+        let res = parse_ssh_config_detailed(input, None);
+        assert_eq!(res.hosts.len(), 1);
+        assert_eq!(res.hosts[0].name, "srv");
+        assert_eq!(res.warnings.len(), 2);
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("Include directive is not followed")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("Match directive is not followed")));
+    }
+
+    #[test]
+    fn filter_and_map_imported_hosts_basic() {
+        let cfg = Config::new();
+        let imported = vec![ImportedHost {
+            name: "srv1".to_string(),
+            host: "1.2.3.4".to_string(),
+            username: Some("alice".to_string()),
+            port: 22,
+            identity_file: Some("/valid/key".to_string()),
+            forward_agent: true,
+        }];
+
+        let res = filter_and_map_imported_hosts(&cfg, imported, None, |_| true);
+        assert_eq!(res.to_import.len(), 1);
+        assert_eq!(res.skipped.len(), 0);
+        assert_eq!(res.to_import[0].name, "srv1");
+        assert_eq!(res.to_import[0].auth_method, AuthMethod::Key);
+        assert_eq!(res.to_import[0].key_path.as_deref(), Some("/valid/key"));
+        assert!(res.to_import[0].use_agent_forwarding);
+    }
+
+    #[test]
+    fn filter_and_map_imported_hosts_collision_skipped() {
+        let mut cfg = Config::new();
+        cfg.servers.push(sample_server("existing"));
+
+        let imported = vec![
+            ImportedHost {
+                name: "existing".to_string(),
+                host: "2.2.2.2".to_string(),
+                username: Some("bob".to_string()),
+                port: 22,
+                identity_file: Some("/key".to_string()),
+                forward_agent: false,
+            },
+            ImportedHost {
+                name: "batch_dup".to_string(),
+                host: "3.3.3.3".to_string(),
+                username: Some("bob".to_string()),
+                port: 22,
+                identity_file: Some("/key".to_string()),
+                forward_agent: false,
+            },
+            ImportedHost {
+                name: "batch_dup".to_string(),
+                host: "4.4.4.4".to_string(),
+                username: Some("bob".to_string()),
+                port: 22,
+                identity_file: Some("/key".to_string()),
+                forward_agent: false,
+            },
+        ];
+
+        let res = filter_and_map_imported_hosts(&cfg, imported, None, |_| true);
+        assert_eq!(res.to_import.len(), 1);
+        assert_eq!(res.to_import[0].name, "batch_dup");
+        assert_eq!(res.skipped.len(), 2);
+        assert_eq!(res.skipped[0].0, "existing");
+        assert_eq!(res.skipped[0].1, "Server already exists");
+        assert_eq!(res.skipped[1].0, "batch_dup");
+        assert_eq!(res.skipped[1].1, "Server already exists");
+    }
+
+    #[test]
+    fn filter_and_map_imported_hosts_missing_key_skipped() {
+        let cfg = Config::new();
+        let imported = vec![ImportedHost {
+            name: "srv".to_string(),
+            host: "1.2.3.4".to_string(),
+            username: Some("alice".to_string()),
+            port: 22,
+            identity_file: Some("/missing/key".to_string()),
+            forward_agent: false,
+        }];
+
+        let res = filter_and_map_imported_hosts(&cfg, imported, None, |p| p != "/missing/key");
+        assert_eq!(res.to_import.len(), 0);
+        assert_eq!(res.skipped.len(), 1);
+        assert!(res.skipped[0].1.contains("SSH key file not found"));
+    }
+
+    #[test]
+    fn filter_and_map_imported_hosts_user_fallback() {
+        let cfg = Config::new();
+        let imported = vec![
+            ImportedHost {
+                name: "srv1".to_string(),
+                host: "1.2.3.4".to_string(),
+                username: None,
+                port: 22,
+                identity_file: Some("/key".to_string()),
+                forward_agent: false,
+            },
+            ImportedHost {
+                name: "srv2".to_string(),
+                host: "1.2.3.5".to_string(),
+                username: None,
+                port: 22,
+                identity_file: Some("/key".to_string()),
+                forward_agent: false,
+            },
+        ];
+
+        // With default_user Some("fallback_user")
+        let res_with_fallback =
+            filter_and_map_imported_hosts(&cfg, imported.clone(), Some("fallback_user"), |_| true);
+        assert_eq!(res_with_fallback.to_import.len(), 2);
+        assert_eq!(res_with_fallback.to_import[0].username, "fallback_user");
+
+        // Without default_user
+        let res_without_fallback = filter_and_map_imported_hosts(&cfg, imported, None, |_| true);
+        assert_eq!(res_without_fallback.to_import.len(), 0);
+        assert_eq!(res_without_fallback.skipped.len(), 2);
+        assert!(res_without_fallback.skipped[0]
+            .1
+            .contains("Username cannot be empty"));
+    }
+
+    #[test]
+    fn filter_and_map_imported_hosts_invalid_server_name() {
+        let cfg = Config::new();
+        let imported = vec![ImportedHost {
+            name: "bad server name!".to_string(),
+            host: "1.2.3.4".to_string(),
+            username: Some("alice".to_string()),
+            port: 22,
+            identity_file: Some("/key".to_string()),
+            forward_agent: false,
+        }];
+
+        let res = filter_and_map_imported_hosts(&cfg, imported, None, |_| true);
+        assert_eq!(res.to_import.len(), 0);
+        assert_eq!(res.skipped.len(), 1);
+        assert!(res.skipped[0].1.contains("Invalid server name"));
     }
 }
