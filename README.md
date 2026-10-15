@@ -15,6 +15,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **SSH Options**: Support for custom ports, SSH agent forwarding, identity files, and jump hosts
 - **SSH Config Import**: Import host configurations from `~/.ssh/config` or custom files with dry-run support
 - **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name and jump host completion
+- **Remote Command Execution**: Run one-off remote commands inline (`ssher exec`) on single servers, tag sets, or all servers with sequential execution and BatchMode protection
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -162,6 +163,53 @@ This will:
 Exact name matches always take precedence. If multiple servers match a partial query, an error lists all candidate matches.
 
 If the server has a configured jump host (`--jump`), `ssher` resolves the jump chain (expanding saved server references to `user@host:port` and chaining outer jump hosts up to 5 hops with cycle detection) and appends `-J <resolved>` to the SSH arguments. Note that `SSH_ASKPASS` applies to the final host only; intermediate jump hosts must use SSH key or agent authentication.
+
+### Execute One-Off Commands
+
+Execute a remote command inline in the current terminal (without spawning an external terminal emulator window) and return SSH's exit status:
+
+```bash
+# Execute on a single server (by exact name or unique partial name)
+ssher exec myserver -- uptime
+ssher exec myserver -- uname -a
+
+# Execute sequentially across multiple servers matching all specified tags
+ssher exec --tag prod --tag web -- df -h
+
+# Execute sequentially across all configured servers
+ssher exec --all -- uptime
+```
+
+#### Behavior & Options:
+- `<target>`: Server name (supports exact match or unique partial-name resolution). Omitted when `--tag` or `--all` is used.
+- `--tag <tag>`: Filter servers by tag (repeatable; must have all specified tags). Runs on each matching server sequentially in saved list order.
+- `--all`: Run sequentially on all configured servers in saved list order.
+- `-- <command...>`: The remote command and its arguments. Everything after `--` is passed to the remote execution.
+
+#### Multi-Server Execution:
+When `--tag` or `--all` is used:
+1. `ssher` prints a `== <name> ==` header before each server's output.
+2. Servers are contacted sequentially in list order.
+3. For SSH key-authenticated servers, `-o BatchMode=yes` is automatically added to avoid blocking on interactive prompts.
+4. If a server fails (non-zero exit status, connection failure, or keyring lookup failure), `ssher` prints the failure/status and continues to the remaining servers.
+5. At the end of execution, `ssher` outputs a summary line: `ok N / failed M`.
+6. `ssher` exits with a non-zero exit status if any server failed.
+
+#### Authentication:
+- **Key authentication**: Identity files and agent forwarding flags configured on the server are used.
+- **Password authentication**: Securely reuses the temporary `SSH_ASKPASS` helper. Passwords are read from the OS keyring and never appear on the command line, environment variables, or process table. Intermediate jump hosts must use SSH keys or agent authentication.
+- Port forwarding presets (`-L`, `-R`, `-D`) are omitted during command execution.
+
+#### Command Quoting Caveat:
+Command arguments after `--` are joined by single spaces into ONE remote command string argument passed to SSH (`ssh [options] user@host -- <command>`). SSH then delivers this command string to the remote user's default login shell for evaluation.
+As a result, shell operators (such as pipes `|`, redirects `>`, or backgrounding `&`) and variable expansions will be evaluated by the remote shell. If you wish to pass arguments containing spaces or literal quotes to the remote command, ensure they are nested or escaped appropriately so they survive remote shell word-splitting:
+```bash
+# Evaluates 'hostname' and 'uptime' remotely through remote shell
+ssher exec myserver -- "hostname && uptime"
+
+# Preserves literal argument with spaces for remote program
+ssher exec myserver -- echo "'hello world'"
+```
 
 ### Edit a Server
 
@@ -525,6 +573,13 @@ ssher connect <name> [OPTIONS]
   -c, --current                 Connect inline in current terminal
   --forward <spec>             Ad-hoc port forward for this connection (repeatable)
   --no-forwards                Do not apply saved port forwarding presets
+
+# Execute one-off remote command inline in current terminal
+ssher exec <target> -- <command...>
+ssher exec --tag <tag> [--tag <tag2>] -- <command...>
+ssher exec --all -- <command...>
+  --tag <tag>                   Filter servers by tag (repeatable, must match all)
+  --all                         Run on all configured servers
 
 # Remove a server
 ssher remove <name>

@@ -598,6 +598,53 @@ pub fn format_tag_completions(servers: &[Server]) -> String {
     output
 }
 
+/// Select servers for exec subcommand based on target name, tags, or all flag.
+///
+/// If `target` is provided, resolves the single server via `resolve_server`.
+/// If `all` is true, returns all servers in list order (or `NoServersMatch` if empty).
+/// If `tags` are provided, validates tags and returns all servers having all specified tags
+/// in list order (or `NoServersMatch` if none match).
+pub fn select_exec_targets<'a>(
+    servers: &'a [Server],
+    target: Option<&str>,
+    tags: &[String],
+    all: bool,
+) -> Result<Vec<&'a Server>> {
+    if let Some(t) = target {
+        let server = resolve_server(servers, t)?;
+        return Ok(vec![server]);
+    }
+
+    if all {
+        if servers.is_empty() {
+            return Err(SshManagerError::NoServersMatch);
+        }
+        return Ok(servers.iter().collect());
+    }
+
+    if !tags.is_empty() {
+        for tag in tags {
+            Storage::validate_tag(tag)?;
+        }
+        let normalized: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+        let matches: Vec<&'a Server> = servers
+            .iter()
+            .filter(|server| {
+                normalized
+                    .iter()
+                    .all(|ft| server.tags.iter().any(|st| st == ft))
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return Err(SshManagerError::NoServersMatch);
+        }
+        return Ok(matches);
+    }
+
+    Err(SshManagerError::NoServersMatch)
+}
+
 /// Pure comparator ordering favourites first, then most-recently-used first, then name.
 pub fn sort_servers(a: &Server, b: &Server) -> std::cmp::Ordering {
     b.favorite
@@ -2512,5 +2559,99 @@ Match host other
 
         assert_eq!(toggle_server_favorite(&mut servers, "nonexistent"), None);
         assert!(!set_server_favorite(&mut servers, "nonexistent", true));
+    }
+
+    #[test]
+    fn select_exec_targets_target_exact_and_partial() {
+        let s1 = sample_server("alpha-node");
+        let s2 = sample_server("beta-node");
+        let servers = vec![s1, s2];
+
+        let res_exact = select_exec_targets(&servers, Some("alpha-node"), &[], false).unwrap();
+        assert_eq!(res_exact.len(), 1);
+        assert_eq!(res_exact[0].name, "alpha-node");
+
+        let res_partial = select_exec_targets(&servers, Some("beta"), &[], false).unwrap();
+        assert_eq!(res_partial.len(), 1);
+        assert_eq!(res_partial[0].name, "beta-node");
+
+        let err_missing = select_exec_targets(&servers, Some("gamma"), &[], false);
+        assert!(matches!(
+            err_missing,
+            Err(SshManagerError::ServerNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn select_exec_targets_all_preserves_order() {
+        let s1 = sample_server("alpha");
+        let s2 = sample_server("gamma");
+        let s3 = sample_server("beta");
+        let servers = vec![s1, s2, s3];
+
+        let res = select_exec_targets(&servers, None, &[], true).unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].name, "alpha");
+        assert_eq!(res[1].name, "gamma");
+        assert_eq!(res[2].name, "beta");
+    }
+
+    #[test]
+    fn select_exec_targets_all_empty_err() {
+        let servers: Vec<Server> = Vec::new();
+        let err = select_exec_targets(&servers, None, &[], true).unwrap_err();
+        assert!(matches!(err, SshManagerError::NoServersMatch));
+        assert!(err.to_string().to_lowercase().contains("no servers match"));
+    }
+
+    #[test]
+    fn select_exec_targets_by_tag_single_and_multiple() {
+        let mut s1 = sample_server("s1");
+        s1.tags = vec!["prod".to_string(), "web".to_string()];
+        let mut s2 = sample_server("s2");
+        s2.tags = vec!["prod".to_string(), "db".to_string()];
+        let mut s3 = sample_server("s3");
+        s3.tags = vec!["staging".to_string(), "web".to_string()];
+        let servers = vec![s1, s2, s3];
+
+        // Single tag: "prod" matches s1 and s2 in list order
+        let res_prod = select_exec_targets(&servers, None, &[String::from("prod")], false).unwrap();
+        assert_eq!(res_prod.len(), 2);
+        assert_eq!(res_prod[0].name, "s1");
+        assert_eq!(res_prod[1].name, "s2");
+
+        // Multiple tags (must have all): "prod" AND "web" matches only s1
+        let res_both = select_exec_targets(
+            &servers,
+            None,
+            &[String::from("prod"), String::from("web")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(res_both.len(), 1);
+        assert_eq!(res_both[0].name, "s1");
+
+        // Case insensitivity
+        let res_upper =
+            select_exec_targets(&servers, None, &[String::from("PROD")], false).unwrap();
+        assert_eq!(res_upper.len(), 2);
+
+        // No matches returns empty-selection error
+        let err = select_exec_targets(
+            &servers,
+            None,
+            &[String::from("prod"), String::from("staging")],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SshManagerError::NoServersMatch));
+        assert!(err.to_string().to_lowercase().contains("no servers match"));
+    }
+
+    #[test]
+    fn select_exec_targets_empty_selection_when_no_flags() {
+        let servers = vec![sample_server("s1")];
+        let err = select_exec_targets(&servers, None, &[], false).unwrap_err();
+        assert!(matches!(err, SshManagerError::NoServersMatch));
     }
 }

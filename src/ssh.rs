@@ -81,6 +81,59 @@ impl Ssh {
         argv
     }
 
+    /// Build the argv for non-interactive `ssh` remote command execution.
+    /// Forwards (-L/-R/-D) are omitted. BatchMode is enabled ONLY for key-auth
+    /// servers when `batch_mode` is true.
+    pub fn build_exec_args(
+        server: &Server,
+        jump: Option<&str>,
+        batch_mode: bool,
+        command: &str,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+
+        if let Some(key_path) = &server.key_path {
+            args.push("-i".to_string());
+            args.push(key_path.clone());
+        }
+
+        if server.use_agent_forwarding {
+            args.push("-A".to_string());
+        }
+
+        if let Some(jump_spec) = jump {
+            args.push("-J".to_string());
+            args.push(jump_spec.to_string());
+        }
+
+        if server.port != 22 {
+            args.push("-p".to_string());
+            args.push(server.port.to_string());
+        }
+
+        if batch_mode && server.auth_method == AuthMethod::Key {
+            args.push("-o".to_string());
+            args.push("BatchMode=yes".to_string());
+        }
+
+        args.push(format!("{}@{}", server.username, server.host));
+        args.push("--".to_string());
+        args.push(command.to_string());
+        args
+    }
+
+    /// Build the full argv for spawning `ssh` exec, with `"ssh"` as argv[0].
+    pub fn build_exec_argv(
+        server: &Server,
+        jump: Option<&str>,
+        batch_mode: bool,
+        command: &str,
+    ) -> Vec<String> {
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(Self::build_exec_args(server, jump, batch_mode, command));
+        argv
+    }
+
     /// Normalize uncommon local TERM values (e.g. `xterm-kitty`, `alacritty`)
     /// to `xterm-256color` so remote servers lacking specialized terminfo databases
     /// do not produce "unknown terminal type" errors.
@@ -195,6 +248,55 @@ impl Ssh {
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         Terminal::spawn_terminal(terminal, &arg_refs, &env_refs)?;
         Ok(())
+    }
+
+    /// Execute a remote command inline in the current terminal, returning ssh's exit status.
+    /// Password authentication reuses the temporary SSH_ASKPASS helper.
+    pub fn execute_command(
+        server: &Server,
+        jump: Option<&str>,
+        batch_mode: bool,
+        command: &str,
+    ) -> Result<std::process::ExitStatus> {
+        let ssh_argv = Self::build_exec_argv(server, jump, batch_mode, command);
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut askpass_dir: Option<PathBuf> = None;
+
+        if let Ok(current_term) = env::var("TERM") {
+            if let Some(normalized) = Self::normalize_term(&current_term) {
+                env.push(("TERM".to_string(), normalized.to_string()));
+            }
+        }
+
+        if server.auth_method == AuthMethod::Password {
+            let password = Self::get_password(&server.name)?;
+            let dir = setup_askpass(&password)?;
+            let script = dir.join("askpass.sh");
+            env.push((
+                "SSH_ASKPASS".to_string(),
+                script.to_string_lossy().into_owned(),
+            ));
+            env.push(("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()));
+            askpass_dir = Some(dir);
+        }
+
+        let mut cmd = std::process::Command::new(&ssh_argv[0]);
+        cmd.args(&ssh_argv[1..]);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+
+        let status_res = cmd.status();
+
+        if let Some(dir) = askpass_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        let status = status_res.map_err(|e| {
+            SshManagerError::SshLaunchFailed(format!("Failed to execute {}: {}", ssh_argv[0], e))
+        })?;
+
+        Ok(status)
     }
 }
 
@@ -404,5 +506,119 @@ mod tests {
         assert_eq!(Ssh::normalize_term("alacritty"), Some("xterm-256color"));
         assert_eq!(Ssh::normalize_term("xterm-256color"), None);
         assert_eq!(Ssh::normalize_term("linux"), None);
+    }
+
+    #[test]
+    fn build_exec_args_key_server() {
+        let args = Ssh::build_exec_args(&key_server(), None, false, "uptime");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "alice@example.com".to_string(),
+                "--".to_string(),
+                "uptime".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_exec_args_key_server_batch_mode() {
+        let args = Ssh::build_exec_args(&key_server(), None, true, "uptime");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "alice@example.com".to_string(),
+                "--".to_string(),
+                "uptime".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_exec_args_password_server() {
+        let args = Ssh::build_exec_args(&password_server(), None, false, "uname -a");
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "bob@example.com".to_string(),
+                "--".to_string(),
+                "uname -a".to_string(),
+            ]
+        );
+        let joined = args.join("\n");
+        assert!(!joined.contains("password"));
+    }
+
+    #[test]
+    fn build_exec_args_password_server_batch_mode_ignored() {
+        // Even when batch_mode is true, BatchMode=yes must NOT be added for password servers.
+        let args = Ssh::build_exec_args(&password_server(), None, true, "uname -a");
+        assert!(!args.contains(&"-o".to_string()));
+        assert!(!args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn build_exec_args_with_jump_host() {
+        let args =
+            Ssh::build_exec_args(&key_server(), Some("jump.example.com"), false, "echo hello");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-J".to_string(),
+                "jump.example.com".to_string(),
+                "alice@example.com".to_string(),
+                "--".to_string(),
+                "echo hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_exec_args_omits_forwards() {
+        let mut s = key_server();
+        s.forwards = vec![
+            Forward::Local {
+                bind_port: 8080,
+                host: "localhost".to_string(),
+                host_port: 80,
+            },
+            Forward::Remote {
+                bind_port: 2222,
+                host: "remote.host".to_string(),
+                host_port: 22,
+            },
+            Forward::Dynamic { bind_port: 1080 },
+        ];
+        let args = Ssh::build_exec_args(&s, None, false, "df -h");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "alice@example.com".to_string(),
+                "--".to_string(),
+                "df -h".to_string(),
+            ]
+        );
+        assert!(!args.contains(&"-L".to_string()));
+        assert!(!args.contains(&"-R".to_string()));
+        assert!(!args.contains(&"-D".to_string()));
+    }
+
+    #[test]
+    fn build_exec_argv_starts_with_ssh() {
+        let argv = Ssh::build_exec_argv(&key_server(), None, false, "hostname");
+        assert_eq!(argv[0], "ssh");
+        assert_eq!(argv.last().map(String::as_str), Some("hostname"));
     }
 }

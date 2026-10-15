@@ -132,6 +132,28 @@ enum Commands {
         no_forwards: bool,
     },
 
+    /// Execute a remote command inline in the current terminal
+    Exec {
+        /// Server name to execute command on
+        #[arg(
+            conflicts_with_all = ["tag", "all"],
+            required_unless_present_any = ["tag", "all"]
+        )]
+        target: Option<String>,
+
+        /// Filter servers by tag (repeatable, must have all tags)
+        #[arg(long = "tag", conflicts_with = "all", action = clap::ArgAction::Append)]
+        tag: Vec<String>,
+
+        /// Run on all configured servers
+        #[arg(long = "all", conflicts_with = "tag")]
+        all: bool,
+
+        /// Command to execute on the remote server
+        #[arg(required = true, num_args = 1.., last = true)]
+        command: Vec<String>,
+    },
+
     /// Remove a saved SSH server
     Remove {
         /// Server name to remove
@@ -292,6 +314,12 @@ fn run(cli: Cli) -> Result<()> {
             forward,
             no_forwards,
         } => connect_server(&name, current, &forward, no_forwards),
+        Commands::Exec {
+            target,
+            tag,
+            all,
+            command,
+        } => exec_servers(target, tag, all, command),
         Commands::Remove { name } => remove_server(&name),
         Commands::Fav { name } => set_favorite(&name, true),
         Commands::Unfav { name } => set_favorite(&name, false),
@@ -620,6 +648,83 @@ fn connect_server(
     Ok(())
 }
 
+fn exec_servers(
+    target: Option<String>,
+    tags: Vec<String>,
+    all: bool,
+    command: Vec<String>,
+) -> Result<()> {
+    let config = Storage::load_config()?;
+    let joined_cmd = command.join(" ");
+    let is_multi = all || !tags.is_empty();
+
+    if !is_multi {
+        let target_name = target.expect("target must be present when not multi-target");
+        let server = config.resolve_server(&target_name)?;
+        let jump = models::resolve_jump(&config, server)?;
+        let status = Ssh::execute_command(server, jump.as_deref(), false, &joined_cmd)?;
+        if let Err(e) = Storage::record_server_launch(&server.name) {
+            eprintln!("Warning: failed to save last used timestamp: {}", e);
+        }
+        if !status.success() {
+            let code = status.code().unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal().map(|s| 128 + s).unwrap_or(1)
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            });
+            std::process::exit(code);
+        }
+        Ok(())
+    } else {
+        let targets = models::select_exec_targets(&config.servers, None, &tags, all)?;
+        let mut ok_count = 0;
+        let mut failed_count = 0;
+
+        for server in targets {
+            println!("== {} ==", server.name);
+            let _ = io::stdout().flush();
+
+            let jump = match models::resolve_jump(&config, server) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Error resolving jump host: {}", e);
+                    failed_count += 1;
+                    continue;
+                }
+            };
+
+            match Ssh::execute_command(server, jump.as_deref(), true, &joined_cmd) {
+                Ok(status) => {
+                    if status.success() {
+                        ok_count += 1;
+                        if let Err(e) = Storage::record_server_launch(&server.name) {
+                            eprintln!("Warning: failed to save last used timestamp: {}", e);
+                        }
+                    } else {
+                        failed_count += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    failed_count += 1;
+                }
+            }
+        }
+
+        println!("ok {} / failed {}", ok_count, failed_count);
+        if failed_count > 0 {
+            std::process::exit(1);
+        }
+        Ok(())
+    }
+}
+
 fn remove_server(name: &str) -> Result<()> {
     let mut config = Storage::load_config()?;
 
@@ -821,7 +926,7 @@ _ssher_complete() {
     local subcmd=""
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove|fav|unfav)
+            connect|edit|remove|fav|unfav|exec)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -853,8 +958,8 @@ fi
         }
         clap_complete::Shell::Fish => {
             let fish_snippet = r#"
-# Dynamic server completion for connect, edit, remove, fav, unfav
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav" -f -a "(ssher __complete-servers)"
+# Dynamic server completion for connect, edit, remove, fav, unfav, exec
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 complete -c ssher -l sort -f -a "recent name"
@@ -883,7 +988,15 @@ complete -c ssher -l sort -f -a "recent name"
                     ":name -- Server name to unfavorite:_default",
                     ":name -- Server name to unfavorite:_ssher_servers",
                 )
-                .replace(":JUMP:_default", ":JUMP:_ssher_servers");
+                .replace(":JUMP:_default", ":JUMP:_ssher_servers")
+                .replace(
+                    "::target -- Server name to execute command on:_default",
+                    "::target -- Server name to execute command on:_ssher_servers",
+                )
+                .replace(
+                    ":target -- Server name to execute command on:_default",
+                    ":target -- Server name to execute command on:_ssher_servers",
+                );
             let zsh_snippet = r#"
 _ssher_servers() {
     local -a servers
@@ -1368,7 +1481,7 @@ mod tests {
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
         assert!(bash.contains("--sort"));
-        assert!(bash.contains("connect|edit|remove|fav|unfav"));
+        assert!(bash.contains("connect|edit|remove|fav|unfav|exec"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
@@ -1383,7 +1496,7 @@ mod tests {
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
-        assert!(fish.contains("connect edit remove fav unfav"));
+        assert!(fish.contains("connect edit remove fav unfav exec"));
         assert!(fish.contains("-l jump"));
         assert!(fish.contains("-l sort"));
     }
@@ -1481,5 +1594,100 @@ mod tests {
             }
             _ => panic!("expected Commands::Import"),
         }
+    }
+
+    #[test]
+    fn cli_parse_exec_single_target() {
+        let cli = Cli::try_parse_from(["ssher", "exec", "myserver", "--", "uptime"]).unwrap();
+        match cli.command {
+            Commands::Exec {
+                target,
+                tag,
+                all,
+                command,
+            } => {
+                assert_eq!(target.as_deref(), Some("myserver"));
+                assert!(tag.is_empty());
+                assert!(!all);
+                assert_eq!(command, vec!["uptime"]);
+            }
+            _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_exec_all() {
+        let cli = Cli::try_parse_from(["ssher", "exec", "--all", "--", "uname", "-a"]).unwrap();
+        match cli.command {
+            Commands::Exec {
+                target,
+                tag,
+                all,
+                command,
+            } => {
+                assert_eq!(target, None);
+                assert!(tag.is_empty());
+                assert!(all);
+                assert_eq!(command, vec!["uname", "-a"]);
+            }
+            _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_exec_tags() {
+        let cli = Cli::try_parse_from([
+            "ssher", "exec", "--tag", "prod", "--tag", "web", "--", "df", "-h",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Exec {
+                target,
+                tag,
+                all,
+                command,
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(tag, vec!["prod", "web"]);
+                assert!(!all);
+                assert_eq!(command, vec!["df", "-h"]);
+            }
+            _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_exec_target_and_all_conflict() {
+        assert!(
+            Cli::try_parse_from(["ssher", "exec", "myserver", "--all", "--", "uptime"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parse_exec_target_and_tag_conflict() {
+        assert!(Cli::try_parse_from([
+            "ssher", "exec", "myserver", "--tag", "prod", "--", "uptime"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn cli_parse_exec_all_and_tag_conflict() {
+        assert!(
+            Cli::try_parse_from(["ssher", "exec", "--all", "--tag", "prod", "--", "uptime"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parse_exec_missing_target_and_flags_errors() {
+        assert!(Cli::try_parse_from(["ssher", "exec", "--", "uptime"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_exec_missing_command_errors() {
+        assert!(Cli::try_parse_from(["ssher", "exec", "myserver"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "exec", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "exec", "myserver", "--"]).is_err());
     }
 }

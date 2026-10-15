@@ -93,6 +93,9 @@ pub enum SshManagerError {
 
     #[error("Invalid port forwarding specification: {0}")]
     InvalidForward(String),
+
+    #[error("No servers match")]
+    NoServersMatch,
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;
