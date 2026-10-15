@@ -23,6 +23,8 @@ pub struct Server {
     pub use_agent_forwarding: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ impl Server {
             key_path,
             use_agent_forwarding: false,
             tags: Vec::new(),
+            jump_host: None,
         }
     }
 }
@@ -86,6 +89,7 @@ pub struct ServerEdit {
     pub auth: Option<AuthEdit>,
     pub agent_forwarding: Option<bool>,
     pub tags: Option<Vec<String>>,
+    pub jump_host: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +107,7 @@ impl ServerEdit {
             && self.auth.is_none()
             && self.agent_forwarding.is_none()
             && self.tags.is_none()
+            && self.jump_host.is_none()
     }
 
     pub fn apply(&self, server: &mut Server, config: &Config) -> Result<()> {
@@ -139,6 +144,46 @@ impl ServerEdit {
             None
         };
 
+        let effective_name = self.new_name.as_deref().unwrap_or(&server.name);
+        let effective_jump = match &self.jump_host {
+            Some(Some(j)) => Some(j.as_str()),
+            Some(None) => None,
+            None => server.jump_host.as_deref(),
+        };
+
+        if let Some(jump) = effective_jump {
+            if self.jump_host.is_some() {
+                Storage::validate_jump_host(jump)?;
+            }
+            if jump == effective_name || (self.new_name.is_some() && jump == server.name) {
+                return Err(SshManagerError::SelfReferentialJumpHost(
+                    effective_name.to_string(),
+                ));
+            }
+            let mut visited = vec![effective_name.to_string()];
+            if effective_name != server.name {
+                visited.push(server.name.clone());
+            }
+            let mut current_spec = jump.to_string();
+            loop {
+                if visited.contains(&current_spec) {
+                    let mut cycle_path = visited.clone();
+                    cycle_path.push(current_spec);
+                    return Err(SshManagerError::JumpHostCycle(cycle_path.join(" -> ")));
+                }
+                if let Some(target) = config.find_server(&current_spec) {
+                    visited.push(target.name.clone());
+                    if let Some(next) = &target.jump_host {
+                        current_spec = next.clone();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
         if let Some(new_name) = &self.new_name {
             server.name = new_name.clone();
         }
@@ -168,12 +213,15 @@ impl ServerEdit {
         if let Some(tags) = normalized_tags {
             server.tags = tags;
         }
+        if let Some(jump) = &self.jump_host {
+            server.jump_host = jump.clone();
+        }
 
         Ok(())
     }
 }
 
-/// Check if a server matches a case-insensitive query across its name, host, or tags.
+/// Check if a server matches a case-insensitive query across its name, host, tags, or jump host.
 /// An empty query matches every server.
 pub fn server_matches_query(server: &Server, query: &str) -> bool {
     if query.is_empty() {
@@ -183,6 +231,87 @@ pub fn server_matches_query(server: &Server, query: &str) -> bool {
     server.name.to_lowercase().contains(&q)
         || server.host.to_lowercase().contains(&q)
         || server.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        || server
+            .jump_host
+            .as_ref()
+            .map(|j| j.to_lowercase().contains(&q))
+            .unwrap_or(false)
+}
+
+/// Resolve the `-J` argument for a server, expanding saved servers into `user@host:port`
+/// and chaining jump hosts outermost-first, with cycle detection and depth limit (5).
+pub fn resolve_jump(config: &Config, server: &Server) -> Result<Option<String>> {
+    let jump_spec = match &server.jump_host {
+        Some(j) => j,
+        None => return Ok(None),
+    };
+
+    let mut hops: Vec<String> = Vec::new();
+    let mut visited: Vec<String> = Vec::new();
+    visited.push(server.name.clone());
+
+    let mut current_spec = jump_spec.clone();
+
+    loop {
+        if hops.len() >= 5 {
+            return Err(SshManagerError::JumpHostDepthExceeded);
+        }
+
+        if visited.contains(&current_spec) {
+            let mut cycle_path = visited.clone();
+            cycle_path.push(current_spec);
+            return Err(SshManagerError::JumpHostCycle(cycle_path.join(" -> ")));
+        }
+
+        if let Some(target_server) = config.find_server(&current_spec) {
+            hops.push(format!(
+                "{}@{}:{}",
+                target_server.username, target_server.host, target_server.port
+            ));
+            visited.push(target_server.name.clone());
+
+            if let Some(next_jump) = &target_server.jump_host {
+                current_spec = next_jump.clone();
+            } else {
+                break;
+            }
+        } else {
+            hops.push(current_spec);
+            break;
+        }
+    }
+
+    if hops.is_empty() {
+        return Ok(None);
+    }
+
+    hops.reverse();
+    Ok(Some(hops.join(",")))
+}
+
+/// Find all servers that reference the given server name as their jump host.
+pub fn find_jump_dependents(servers: &[Server], server_name: &str) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|s| s.jump_host.as_deref() == Some(server_name))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// Update all jump_host references from old_name to new_name. Returns the number of updated references.
+pub fn update_jump_host_references(
+    servers: &mut [Server],
+    old_name: &str,
+    new_name: &str,
+) -> usize {
+    let mut count = 0;
+    for s in servers {
+        if s.jump_host.as_deref() == Some(old_name) {
+            s.jump_host = Some(new_name.to_string());
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Filter a list of servers by query, returning indices into the slice.
@@ -1463,5 +1592,258 @@ Match host other
         assert_eq!(res.to_import.len(), 0);
         assert_eq!(res.skipped.len(), 1);
         assert!(res.skipped[0].1.contains("Invalid server name"));
+    }
+
+    #[test]
+    fn resolve_jump_none_when_no_jump_host() {
+        let cfg = Config::new();
+        let server = sample_server("srv");
+        assert_eq!(resolve_jump(&cfg, &server).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_jump_raw_spec_passthrough() {
+        let cfg = Config::new();
+        let mut server = sample_server("srv");
+        server.jump_host = Some("user@jump.example.com:2222".to_string());
+        assert_eq!(
+            resolve_jump(&cfg, &server).unwrap(),
+            Some("user@jump.example.com:2222".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_jump_expands_saved_server_single_hop() {
+        let mut cfg = Config::new();
+        let mut bastion = sample_server("bastion");
+        bastion.username = "bastion_user".to_string();
+        bastion.host = "bastion.corp.net".to_string();
+        bastion.port = 2200;
+        cfg.servers.push(bastion);
+
+        let mut srv = sample_server("srv");
+        srv.jump_host = Some("bastion".to_string());
+        assert_eq!(
+            resolve_jump(&cfg, &srv).unwrap(),
+            Some("bastion_user@bastion.corp.net:2200".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_jump_chains_saved_servers_outermost_first() {
+        let mut cfg = Config::new();
+        // A has no jump host
+        let mut a = sample_server("A");
+        a.username = "usera".to_string();
+        a.host = "hosta".to_string();
+        a.port = 22;
+        cfg.servers.push(a);
+
+        // B jumps through A
+        let mut b = sample_server("B");
+        b.username = "userb".to_string();
+        b.host = "hostb".to_string();
+        b.port = 2222;
+        b.jump_host = Some("A".to_string());
+        cfg.servers.push(b);
+
+        // C jumps through B
+        let mut c = sample_server("C");
+        c.username = "userc".to_string();
+        c.host = "hostc".to_string();
+        c.port = 22;
+        c.jump_host = Some("B".to_string());
+        cfg.servers.push(c.clone());
+
+        assert_eq!(
+            resolve_jump(&cfg, &c).unwrap(),
+            Some("usera@hosta:22,userb@hostb:2222".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_jump_chains_saved_server_with_raw_spec() {
+        let mut cfg = Config::new();
+        // B jumps through raw spec
+        let mut b = sample_server("B");
+        b.username = "userb".to_string();
+        b.host = "hostb".to_string();
+        b.port = 2222;
+        b.jump_host = Some("jump.raw.com:2200".to_string());
+        cfg.servers.push(b);
+
+        // C jumps through B
+        let mut c = sample_server("C");
+        c.jump_host = Some("B".to_string());
+
+        assert_eq!(
+            resolve_jump(&cfg, &c).unwrap(),
+            Some("jump.raw.com:2200,userb@hostb:2222".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_jump_cycle_detection() {
+        let mut cfg = Config::new();
+        let mut a = sample_server("A");
+        a.jump_host = Some("B".to_string());
+        let mut b = sample_server("B");
+        b.jump_host = Some("A".to_string());
+        cfg.servers.push(a.clone());
+        cfg.servers.push(b);
+
+        let err = resolve_jump(&cfg, &a).unwrap_err();
+        assert!(matches!(err, SshManagerError::JumpHostCycle(msg) if msg.contains("A -> B -> A")));
+    }
+
+    #[test]
+    fn resolve_jump_depth_limit() {
+        let mut cfg = Config::new();
+        // Create a chain of 6 servers: s1 -> s2 -> s3 -> s4 -> s5 -> s6
+        for i in 1..=6 {
+            let mut s = sample_server(&format!("s{}", i));
+            if i < 6 {
+                s.jump_host = Some(format!("s{}", i + 1));
+            }
+            cfg.servers.push(s);
+        }
+
+        // Target s0 jumps through s1 -> s2 -> s3 -> s4 -> s5 (5 hops allowed)
+        let mut s0 = sample_server("s0");
+        s0.jump_host = Some("s1".to_string());
+        // Truncate config so s5 has no jump host: chain s1..s5 is 5 hops
+        cfg.servers[4].jump_host = None;
+        let res5 = resolve_jump(&cfg, &s0);
+        assert!(res5.is_ok());
+
+        // Restore s5 -> s6: chain s1..s6 is 6 hops -> exceeds depth 5
+        cfg.servers[4].jump_host = Some("s6".to_string());
+        let res6 = resolve_jump(&cfg, &s0);
+        assert!(matches!(res6, Err(SshManagerError::JumpHostDepthExceeded)));
+    }
+
+    #[test]
+    fn update_jump_host_references_updates_dependents() {
+        let mut servers = vec![sample_server("A"), sample_server("B"), sample_server("C")];
+        servers[1].jump_host = Some("A".to_string());
+        servers[2].jump_host = Some("A".to_string());
+
+        let count = update_jump_host_references(&mut servers, "A", "A_new");
+        assert_eq!(count, 2);
+        assert_eq!(servers[1].jump_host.as_deref(), Some("A_new"));
+        assert_eq!(servers[2].jump_host.as_deref(), Some("A_new"));
+    }
+
+    #[test]
+    fn find_jump_dependents_finds_all() {
+        let mut servers = vec![sample_server("A"), sample_server("B"), sample_server("C")];
+        servers[1].jump_host = Some("A".to_string());
+        servers[2].jump_host = Some("A".to_string());
+
+        let mut deps = find_jump_dependents(&servers, "A");
+        deps.sort();
+        assert_eq!(deps, vec!["B".to_string(), "C".to_string()]);
+
+        let deps_empty = find_jump_dependents(&servers, "B");
+        assert!(deps_empty.is_empty());
+    }
+
+    #[test]
+    fn edit_apply_jump_host() {
+        let cfg = Config::new();
+        let mut s = sample_server("srv");
+        assert_eq!(s.jump_host, None);
+
+        let edit = ServerEdit {
+            jump_host: Some(Some("bastion.example.com".to_string())),
+            ..Default::default()
+        };
+        edit.apply(&mut s, &cfg).unwrap();
+        assert_eq!(s.jump_host.as_deref(), Some("bastion.example.com"));
+
+        // Clear jump host
+        let clear_edit = ServerEdit {
+            jump_host: Some(None),
+            ..Default::default()
+        };
+        clear_edit.apply(&mut s, &cfg).unwrap();
+        assert_eq!(s.jump_host, None);
+    }
+
+    #[test]
+    fn edit_apply_jump_host_validation_failures() {
+        let mut cfg = Config::new();
+        let mut bastion = sample_server("bastion");
+        bastion.jump_host = Some("srv".to_string());
+        cfg.servers.push(bastion);
+
+        let mut s = sample_server("srv");
+
+        // Empty jump host
+        let err_empty = ServerEdit {
+            jump_host: Some(Some("".to_string())),
+            ..Default::default()
+        }
+        .apply(&mut s, &cfg);
+        assert!(matches!(err_empty, Err(SshManagerError::EmptyJumpHost)));
+
+        // Shell metacharacter in jump host
+        let err_meta = ServerEdit {
+            jump_host: Some(Some("bastion; rm -rf /".to_string())),
+            ..Default::default()
+        }
+        .apply(&mut s, &cfg);
+        assert!(matches!(err_meta, Err(SshManagerError::InvalidJumpHost(_))));
+
+        // Self referential jump host
+        let err_self = ServerEdit {
+            jump_host: Some(Some("srv".to_string())),
+            ..Default::default()
+        }
+        .apply(&mut s, &cfg);
+        assert!(matches!(
+            err_self,
+            Err(SshManagerError::SelfReferentialJumpHost(_))
+        ));
+
+        // Cycle: srv -> bastion -> srv
+        let err_cycle = ServerEdit {
+            jump_host: Some(Some("bastion".to_string())),
+            ..Default::default()
+        }
+        .apply(&mut s, &cfg);
+        assert!(matches!(err_cycle, Err(SshManagerError::JumpHostCycle(_))));
+    }
+
+    #[test]
+    fn server_parses_from_json_without_jump_host_backward_compat() {
+        let json = r#"{
+            "name": "srv",
+            "host": "1.2.3.4",
+            "username": "alice",
+            "port": 22,
+            "auth_method": "key"
+        }"#;
+        let s: Server = serde_json::from_str(json).unwrap();
+        assert_eq!(s.jump_host, None);
+    }
+
+    #[test]
+    fn server_round_trips_through_json_with_jump_host() {
+        let mut s = sample_server("srv");
+        s.jump_host = Some("bastion:2222".to_string());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"jump_host\":\"bastion:2222\""));
+
+        let deserialized: Server = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.jump_host.as_deref(), Some("bastion:2222"));
+    }
+
+    #[test]
+    fn server_matches_query_with_jump_host() {
+        let mut s = sample_server("srv");
+        s.jump_host = Some("bastion.corp".to_string());
+        assert!(server_matches_query(&s, "bastion"));
+        assert!(!server_matches_query(&s, "otherproxy"));
     }
 }

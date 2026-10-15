@@ -303,9 +303,10 @@ impl Tui {
         println!("{}", "=".repeat(60));
 
         let terminal_name = Terminal::get_terminal_command(config.preferred_terminal.as_deref())?;
+        let jump = crate::models::resolve_jump(config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name)?;
+        Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
         Ok(())
     }
 
@@ -313,6 +314,9 @@ impl Tui {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "REMOVE SERVER");
         println!("{}", "=".repeat(60));
+
+        let mut config = Storage::load_config()?;
+        Storage::validate_server_removal(&config, server_name)?;
 
         print!(
             "\nAre you sure you want to remove '{}'? (y/n): ",
@@ -327,7 +331,6 @@ impl Tui {
             return Ok(());
         }
 
-        let mut config = Storage::load_config()?;
         config.servers.retain(|s| s.name != server_name);
         Storage::save_config(&config)?;
         let _ = Ssh::delete_password(server_name);
@@ -488,6 +491,20 @@ impl Tui {
             Some(Storage::normalize_tags(&parsed)?)
         };
 
+        let current_jump_desc = server.jump_host.as_deref().unwrap_or("none");
+        print!("Jump host [{}]: ", current_jump_desc);
+        io::stdout().flush()?;
+        let mut jump_str = String::new();
+        io::stdin().read_line(&mut jump_str)?;
+        let jump_trimmed = jump_str.trim();
+        let jump_host = if jump_trimmed.is_empty() {
+            None
+        } else if jump_trimmed == "-" {
+            Some(None)
+        } else {
+            Some(Some(jump_trimmed.to_string()))
+        };
+
         let edit = ServerEdit {
             new_name,
             host,
@@ -496,6 +513,7 @@ impl Tui {
             auth,
             agent_forwarding,
             tags,
+            jump_host,
         };
 
         let mut config = Storage::load_config()?;
@@ -697,10 +715,10 @@ impl Tui {
             f.render_widget(no_match_msg, chunks[1]);
         } else {
             let col_header = format!(
-                "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
-                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "TAGS"
+                "  {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
+                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "VIA", "TAGS"
             );
-            let separator = format!("  {}", "─".repeat(95));
+            let separator = format!("  {}", "─".repeat(105));
 
             let mut items = Vec::new();
             items.push(
@@ -719,6 +737,7 @@ impl Tui {
                     AuthMethod::Password => "password",
                 };
                 let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
+                let via_str = s.jump_host.as_deref().unwrap_or("-");
                 let tags_str = if s.tags.is_empty() {
                     "-".to_string()
                 } else {
@@ -727,8 +746,8 @@ impl Tui {
 
                 if view_idx == selected_index {
                     let line = format!(
-                        "▶ {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str, tags_str
+                        "▶ {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str, via_str, tags_str
                     );
                     items.push(
                         ListItem::new(line).style(
@@ -739,8 +758,8 @@ impl Tui {
                     );
                 } else {
                     let line = format!(
-                        "  {:<20} {:<24} {:<15} {:<8} {:<10} {:<10} {}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str, tags_str
+                        "  {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
+                        s.name, s.host, s.username, s.port, auth_str, af_str, via_str, tags_str
                     );
                     items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
                 }
@@ -873,9 +892,9 @@ impl Tui {
     fn show_list() -> Result<()> {
         let config = crate::storage::Storage::load_config()?;
 
-        println!("\n{}", "=".repeat(110));
-        println!("{:^110}", "SSH SERVERS");
-        println!("{}", "=".repeat(110));
+        println!("\n{}", "=".repeat(122));
+        println!("{:^122}", "SSH SERVERS");
+        println!("{}", "=".repeat(122));
 
         if config.servers.is_empty() {
             println!("\nNo servers configured.\n");
@@ -883,10 +902,10 @@ impl Tui {
         }
 
         println!(
-            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
-            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Tags"
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Tags"
         );
-        println!("{}", "─".repeat(110));
+        println!("{}", "─".repeat(122));
 
         for server in &config.servers {
             let auth = match server.auth_method {
@@ -898,6 +917,7 @@ impl Tui {
             } else {
                 "no"
             };
+            let via_str = server.jump_host.as_deref().unwrap_or("-");
             let tags_str = if server.tags.is_empty() {
                 "-".to_string()
             } else {
@@ -905,8 +925,15 @@ impl Tui {
             };
 
             println!(
-                "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
-                server.name, server.host, server.username, server.port, auth, agent_fw, tags_str
+                "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+                server.name,
+                server.host,
+                server.username,
+                server.port,
+                auth,
+                agent_fw,
+                via_str,
+                tags_str
             );
         }
         println!();
@@ -1002,6 +1029,18 @@ impl Tui {
             return Err(SshManagerError::ServerAlreadyExists(name.to_string()));
         }
 
+        print!("Jump host (saved server name or [user@]host[:port], optional): ");
+        io::stdout().flush()?;
+        let mut jump_str = String::new();
+        io::stdin().read_line(&mut jump_str)?;
+        let jump_trimmed = jump_str.trim();
+        let jump_host = if jump_trimmed.is_empty() {
+            None
+        } else {
+            Storage::validate_server_jump(&config, name, jump_trimmed)?;
+            Some(jump_trimmed.to_string())
+        };
+
         let mut server = Server::new(
             name.to_string(),
             host.to_string(),
@@ -1012,6 +1051,7 @@ impl Tui {
         );
         server.use_agent_forwarding = agent_forwarding;
         server.tags = tags;
+        server.jump_host = jump_host;
 
         config.servers.push(server);
         Storage::save_config(&config)?;
@@ -1051,9 +1091,10 @@ impl Tui {
 
         let server = &config.servers[idx - 1];
         let terminal_name = Terminal::get_terminal_command(config.preferred_terminal.as_deref())?;
+        let jump = crate::models::resolve_jump(&config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name)?;
+        Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
 
         Ok(())
     }
@@ -1063,7 +1104,7 @@ impl Tui {
         println!("{:^60}", "REMOVE SERVER");
         println!("{}", "=".repeat(60));
 
-        let config = Storage::load_config()?;
+        let mut config = Storage::load_config()?;
 
         if config.servers.is_empty() {
             println!("\nNo servers configured.\n");
@@ -1087,6 +1128,7 @@ impl Tui {
         }
 
         let server_name = config.servers[idx - 1].name.clone();
+        Storage::validate_server_removal(&config, &server_name)?;
 
         print!("Are you sure? (y/n): ");
         io::stdout().flush()?;
@@ -1098,7 +1140,6 @@ impl Tui {
             return Ok(());
         }
 
-        let mut config = Storage::load_config()?;
         config.servers.retain(|s| s.name != server_name);
         Storage::save_config(&config)?;
         let _ = Ssh::delete_password(&server_name);

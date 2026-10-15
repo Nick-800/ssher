@@ -6,12 +6,13 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 
 - **Server Management**: Add, list, and remove SSH server configurations
 - **Flexible Authentication**: Support both SSH key and password-based authentication
+- **Jump Host / ProxyJump**: Support for bastion/jump hosts via saved server references or raw SSH jump specs, with chain resolution and cycle detection
 - **Tags & Filtering**: Organize servers with tags, filter by tag sets, and search tags in the browser
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
-- **SSH Options**: Support for custom ports, SSH agent forwarding, and identity files
+- **SSH Options**: Support for custom ports, SSH agent forwarding, identity files, and jump hosts
 - **SSH Config Import**: Import host configurations from `~/.ssh/config` or custom files with dry-run support
-- **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name completion
+- **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name and jump host completion
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -70,6 +71,12 @@ Add a server with custom port and agent forwarding:
 ssher add myserver example.com username --key /path/to/key --port 2222 --agent-forwarding
 ```
 
+Add a server with a jump host (either a saved server name or a raw `[user@]host[:port]` spec):
+```bash
+ssher add internal-node 10.0.0.5 admin --key /path/to/key --jump bastion
+ssher add internal-node 10.0.0.5 admin --key /path/to/key --jump jumpuser@jump.example.com:2222
+```
+
 ### List All Servers
 
 List all configured servers:
@@ -84,10 +91,11 @@ ssher list --tag prod --tag web
 
 Output:
 ```
-Name                 Host                 Username        Port       Auth         Agent FW   Tags
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-myserver             example.com          username        22         key          no         prod, web
-prod-server          prod.example.com     root            22         password     yes        -
+Name                 Host                 Username        Port       Auth         Agent FW   Via          Tags
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myserver             example.com          username        22         key          no         -            prod, web
+internal-node        10.0.0.5             admin           22         key          no         bastion      -
+prod-server          prod.example.com     root            22         password     yes        -            -
 ```
 
 ### Connect to a Server
@@ -108,6 +116,8 @@ This will:
 
 Exact name matches always take precedence. If multiple servers match a partial query, an error lists all candidate matches.
 
+If the server has a configured jump host (`--jump`), `ssher` resolves the jump chain (expanding saved server references to `user@host:port` and chaining outer jump hosts up to 5 hops with cycle detection) and appends `-J <resolved>` to the SSH arguments. Note that `SSH_ASKPASS` applies to the final host only; intermediate jump hosts must use SSH key or agent authentication.
+
 ### Edit a Server
 
 Modify an existing server configuration in place:
@@ -117,6 +127,7 @@ Modify an existing server configuration in place:
 ssher edit myserver --host new.example.com --port 2222
 
 # Rename a server (automatically transfers keyring password if using password auth)
+# and updates jump host references in dependent servers
 ssher edit myserver --new-name prodserver
 
 # Switch to key authentication
@@ -133,6 +144,12 @@ ssher edit myserver --tag staging --tag api
 
 # Clear all tags
 ssher edit myserver --clear-tags
+
+# Set or update jump host (saved server name or raw spec)
+ssher edit myserver --jump bastion
+
+# Clear jump host
+ssher edit myserver --clear-jump
 ```
 
 ### Remove a Server
@@ -141,7 +158,7 @@ ssher edit myserver --clear-tags
 ssher remove myserver
 ```
 
-This will remove the server configuration and clean up any stored password from the keyring.
+This will remove the server configuration and clean up any stored password from the keyring. If other saved servers reference this server as their jump host, removal is refused with an error listing the dependent servers until their jump host references are updated or cleared.
 
 ### Import from SSH Config
 
@@ -172,15 +189,15 @@ ssher
 
 Select **Browse Servers** to open the in-terminal server browser.
 
-The browser displays server tags in a dedicated column for quick visibility.
+The browser displays jump hosts and tags in dedicated `VIA` and `TAGS` columns for quick visibility.
 
 #### Browser Keybindings:
 - `j` / `k` or `↓` / `↑`: Move selection up/down
-- `Enter`: Connect to selected server
-- `a`: Add a new server (prompts include comma-separated tags)
-- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current tags)
-- `d`: Delete selected server (with y/n confirmation)
-- `/`: Filter servers by name, host, or tags (case-insensitive substring)
+- `Enter`: Connect to selected server (automatically routing through configured jump hosts)
+- `a`: Add a new server (prompts include comma-separated tags and optional jump host)
+- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host)
+- `d`: Delete selected server (with y/n confirmation; blocked if referenced as a jump host)
+- `/`: Filter servers by name, host, tags, or jump host (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
 
@@ -246,7 +263,7 @@ ssher completions powershell | Out-String | Invoke-Expression
 
 #### Dynamic Server Name and Tag Completion
 
-For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names (for `connect`, `edit`, and `remove`) and distinct server tags (for `--tag`) via the hidden subcommands:
+For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names (for `connect`, `edit`, `remove`, and `--jump`) and distinct server tags (for `--tag`) via the hidden subcommands:
 
 ```bash
 ssher __complete-servers
@@ -267,6 +284,14 @@ _ssher_complete() {
         --host|--username|--port|--key|--agent-forwarding|--new-name)
             _ssher "$@"
             return 0
+            ;;
+        --jump)
+            local servers
+            servers="$(ssher __complete-servers 2>/dev/null)"
+            if [[ -n "${servers}" ]]; then
+                COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
+                return 0
+            fi
             ;;
         --tag)
             local tags
@@ -328,6 +353,7 @@ _ssher_tags() {
 ```fish
 complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
+complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 ```
 
 ## Configuration Files
@@ -342,13 +368,23 @@ All configuration is stored in `~/.config/ssh_manager/`:
 ```json
 [
   {
-    "name": "myserver",
-    "host": "example.com",
-    "username": "username",
+    "name": "bastion",
+    "host": "bastion.example.com",
+    "username": "jumpuser",
     "port": 22,
     "auth_method": "key",
     "key_path": "/home/user/.ssh/id_rsa",
     "use_agent_forwarding": false
+  },
+  {
+    "name": "myserver",
+    "host": "10.0.0.5",
+    "username": "username",
+    "port": 22,
+    "auth_method": "key",
+    "key_path": "/home/user/.ssh/id_rsa",
+    "use_agent_forwarding": false,
+    "jump_host": "bastion"
   },
   {
     "name": "prod-server",
@@ -371,7 +407,9 @@ Passwords are stored securely in your system's keyring:
 Passwords are **never** stored in plain text on disk. When connecting, the
 password is delivered to `ssh` through `SSH_ASKPASS` — it never appears in
 the parent process's command line, environment of the spawned terminal, or
-the system process table.
+the system process table. Note that `SSH_ASKPASS` applies to the final
+destination host only; intermediate jump hosts must authenticate via SSH
+keys or an SSH agent.
 
 ## Error Handling
 
@@ -383,6 +421,9 @@ The application provides clear error messages for common issues:
 - `Failed to set up SSH_ASKPASS helper: ...` — Could not write the temporary
   askpass helper (used for password auth)
 - `Invalid configuration: ...` — Config file is corrupted or invalid
+- `Cannot remove server '...': referenced as jump host by: ...` — Server is referenced by other configurations
+- `Jump host cycle detected: ...` — Jump host chains cannot form a cycle
+- `Jump host chain exceeds maximum depth of 5 hops` — Jump chains cannot exceed 5 hops
 
 ## Command Reference
 
@@ -394,6 +435,7 @@ ssher add <name> <host> <username> [OPTIONS]
   --port <port>                Default: 22
   --agent-forwarding           Enable SSH agent forwarding
   --tag <tag>                  Server tag (repeatable)
+  --jump <spec>                Jump host (saved server name or [user@]host[:port])
 
 # Edit a server
 ssher edit <name> [OPTIONS]
@@ -406,6 +448,8 @@ ssher edit <name> [OPTIONS]
   --new-name <name>             New server identifier name
   --tag <tag>                  Set server tags (repeatable, replaces current tags)
   --clear-tags                 Clear all tags from server
+  --jump <spec>                Set jump host (saved server name or [user@]host[:port])
+  --clear-jump                 Clear jump host from server
 
 # List servers
 ssher list [OPTIONS]

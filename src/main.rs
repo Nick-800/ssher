@@ -47,6 +47,9 @@ enum Commands {
         /// Server tags (repeatable)
         #[arg(long = "tag", action = clap::ArgAction::Append)]
         tag: Vec<String>,
+        /// SSH jump host (saved server name or [user@]host[:port])
+        #[arg(long = "jump")]
+        jump: Option<String>,
     },
 
     /// Modify a saved SSH server
@@ -80,6 +83,12 @@ enum Commands {
         /// Clear all tags from server
         #[arg(long, conflicts_with = "tag")]
         clear_tags: bool,
+        /// SSH jump host (saved server name or [user@]host[:port])
+        #[arg(long = "jump", conflicts_with = "clear_jump")]
+        jump: Option<String>,
+        /// Clear jump host from server
+        #[arg(long, conflicts_with = "jump")]
+        clear_jump: bool,
     },
 
     /// List all saved SSH servers
@@ -178,6 +187,7 @@ fn run(cli: Cli) -> Result<()> {
             password,
             agent_forwarding,
             tag,
+            jump,
         } => add_server(
             name,
             AddArgs {
@@ -188,6 +198,7 @@ fn run(cli: Cli) -> Result<()> {
                 use_password: password,
                 agent_forwarding,
                 tags: tag,
+                jump,
             },
         ),
         Commands::Edit {
@@ -201,8 +212,15 @@ fn run(cli: Cli) -> Result<()> {
             new_name,
             tag,
             clear_tags,
+            jump,
+            clear_jump,
         } => {
             let tags = if clear_tags { Some(Vec::new()) } else { tag };
+            let jump_host = if clear_jump {
+                Some(None)
+            } else {
+                jump.map(Some)
+            };
             edit_server(
                 name,
                 EditArgs {
@@ -214,6 +232,7 @@ fn run(cli: Cli) -> Result<()> {
                     agent_forwarding,
                     new_name,
                     tags,
+                    jump_host,
                 },
             )
         }
@@ -246,6 +265,7 @@ struct AddArgs {
     use_password: bool,
     agent_forwarding: bool,
     tags: Vec<String>,
+    jump: Option<String>,
 }
 
 fn add_server(name: String, args: AddArgs) -> Result<()> {
@@ -261,6 +281,10 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     // Check if server already exists
     if !Storage::server_name_is_unique(&config, &name, None) {
         return Err(error::SshManagerError::ServerAlreadyExists(name));
+    }
+
+    if let Some(jump) = &args.jump {
+        Storage::validate_server_jump(&config, &name, jump)?;
     }
 
     // Determine authentication method
@@ -308,6 +332,7 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     );
     server.use_agent_forwarding = args.agent_forwarding;
     server.tags = normalized_tags;
+    server.jump_host = args.jump;
 
     config.servers.push(server);
     Storage::save_config(&config)?;
@@ -346,10 +371,10 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
     }
 
     println!(
-        "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
-        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Tags"
+        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Tags"
     );
-    println!("{}", "─".repeat(110));
+    println!("{}", "─".repeat(122));
 
     for server in matching_servers {
         let auth = match server.auth_method {
@@ -361,6 +386,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         } else {
             "no"
         };
+        let via_str = server.jump_host.as_deref().unwrap_or("-");
         let tags_str = if server.tags.is_empty() {
             "-".to_string()
         } else {
@@ -368,8 +394,15 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         };
 
         println!(
-            "{:<20} {:<20} {:<15} {:<10} {:<12} {:<10} {:<20}",
-            server.name, server.host, server.username, server.port, auth, agent_fw, tags_str
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+            server.name,
+            server.host,
+            server.username,
+            server.port,
+            auth,
+            agent_fw,
+            via_str,
+            tags_str
         );
     }
 
@@ -385,6 +418,7 @@ struct EditArgs {
     agent_forwarding: Option<bool>,
     new_name: Option<String>,
     tags: Option<Vec<String>>,
+    jump_host: Option<Option<String>>,
 }
 
 fn edit_server(name: String, args: EditArgs) -> Result<()> {
@@ -396,6 +430,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         && args.agent_forwarding.is_none()
         && args.new_name.is_none()
         && args.tags.is_none()
+        && args.jump_host.is_none()
     {
         return Err(error::SshManagerError::NothingToChange);
     }
@@ -434,6 +469,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         auth,
         agent_forwarding: args.agent_forwarding,
         tags: args.tags,
+        jump_host: args.jump_host,
     };
 
     Storage::execute_server_edit(&mut config, &name, edit, new_password)?;
@@ -444,6 +480,7 @@ fn connect_server(name: &str, force_current: bool) -> Result<()> {
     let config = Storage::load_config()?;
 
     let server = config.resolve_server(name)?;
+    let jump = models::resolve_jump(&config, server)?;
 
     // Get terminal to use
     let terminal_name = if force_current {
@@ -453,7 +490,7 @@ fn connect_server(name: &str, force_current: bool) -> Result<()> {
     };
 
     println!("Connecting to {}...", server.name);
-    Ssh::launch_connection(server, &terminal_name)?;
+    Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
 
     Ok(())
 }
@@ -465,6 +502,8 @@ fn remove_server(name: &str) -> Result<()> {
     if !config.servers.iter().any(|s| s.name == name) {
         return Err(error::SshManagerError::ServerNotFound(name.to_string()));
     }
+
+    Storage::validate_server_removal(&config, name)?;
 
     // Remove server
     config.servers.retain(|s| s.name != name);
@@ -632,6 +671,14 @@ _ssher_complete() {
             _ssher "$@"
             return 0
             ;;
+        --jump)
+            local servers
+            servers="$(ssher __complete-servers 2>/dev/null)"
+            if [[ -n "${servers}" ]]; then
+                COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
+                return 0
+            fi
+            ;;
         --tag)
             local tags
             tags="$(ssher __complete-tags 2>/dev/null)"
@@ -680,6 +727,7 @@ fi
 # Dynamic server completion for connect, edit, remove
 complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
+complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 "#;
             format!("{raw}{fish_snippet}")
         }
@@ -696,7 +744,8 @@ complete -c ssher -l tag -f -a "(ssher __complete-tags)"
                 .replace(
                     ":name -- Server name to remove:_default",
                     ":name -- Server name to remove:_ssher_servers",
-                );
+                )
+                .replace(":JUMP:_default", ":JUMP:_ssher_servers");
             let zsh_snippet = r#"
 _ssher_servers() {
     local -a servers
@@ -774,6 +823,8 @@ mod tests {
                 new_name,
                 tag,
                 clear_tags,
+                jump,
+                clear_jump,
             } => {
                 assert_eq!(name, "myserver");
                 assert_eq!(host.as_deref(), Some("example.com"));
@@ -785,6 +836,8 @@ mod tests {
                 assert_eq!(new_name.as_deref(), Some("newserver"));
                 assert_eq!(tag, None);
                 assert!(!clear_tags);
+                assert_eq!(jump, None);
+                assert!(!clear_jump);
             }
             _ => panic!("expected Commands::Edit"),
         }
@@ -959,17 +1012,73 @@ mod tests {
         assert!(bash.contains("__complete-servers"));
         assert!(bash.contains("__complete-tags"));
         assert!(bash.contains("_ssher_complete"));
+        assert!(bash.contains("--jump"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
         assert!(zsh.contains("__complete-tags"));
         assert!(zsh.contains("_ssher_servers"));
         assert!(zsh.contains("_ssher_tags"));
+        assert!(zsh.contains(":JUMP:_ssher_servers"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
+        assert!(fish.contains("-l jump"));
+    }
+
+    #[test]
+    fn cli_parse_add_jump() {
+        let cli = Cli::try_parse_from([
+            "ssher", "add", "srv", "1.2.3.4", "root", "--key", "/key", "--jump", "bastion",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Add { jump, .. } => {
+                assert_eq!(jump.as_deref(), Some("bastion"));
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_jump() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--jump", "user@proxy:22"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                jump, clear_jump, ..
+            } => {
+                assert_eq!(jump.as_deref(), Some("user@proxy:22"));
+                assert!(!clear_jump);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_clear_jump() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--clear-jump"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                jump, clear_jump, ..
+            } => {
+                assert_eq!(jump, None);
+                assert!(clear_jump);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_jump_and_clear_jump_conflict() {
+        assert!(
+            Cli::try_parse_from(["ssher", "edit", "srv", "--jump", "bastion", "--clear-jump"])
+                .is_err()
+        );
     }
 
     #[test]

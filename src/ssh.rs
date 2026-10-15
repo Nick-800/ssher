@@ -15,7 +15,7 @@ impl Ssh {
     /// Build the argv for `ssh` itself, NOT including any password helper.
     /// The caller is responsible for configuring `SSH_ASKPASS` etc. if the
     /// server uses password authentication.
-    pub fn build_ssh_args(server: &Server) -> Vec<String> {
+    pub fn build_ssh_args(server: &Server, jump: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
 
         if let Some(key_path) = &server.key_path {
@@ -25,6 +25,11 @@ impl Ssh {
 
         if server.use_agent_forwarding {
             args.push("-A".to_string());
+        }
+
+        if let Some(jump_spec) = jump {
+            args.push("-J".to_string());
+            args.push(jump_spec.to_string());
         }
 
         if server.port != 22 {
@@ -37,9 +42,9 @@ impl Ssh {
     }
 
     /// Build the full argv for spawning `ssh`, with `"ssh"` as argv[0].
-    pub fn build_ssh_argv(server: &Server) -> Vec<String> {
+    pub fn build_ssh_argv(server: &Server, jump: Option<&str>) -> Vec<String> {
         let mut argv = vec!["ssh".to_string()];
-        argv.extend(Self::build_ssh_args(server));
+        argv.extend(Self::build_ssh_args(server, jump));
         argv
     }
 
@@ -88,8 +93,8 @@ impl Ssh {
 
     /// Launch SSH connection in a terminal. Passwords are passed via
     /// `SSH_ASKPASS`, never as command-line arguments.
-    pub fn launch_connection(server: &Server, terminal: &str) -> Result<()> {
-        let ssh_argv = Self::build_ssh_argv(server);
+    pub fn launch_connection(server: &Server, terminal: &str, jump: Option<&str>) -> Result<()> {
+        let ssh_argv = Self::build_ssh_argv(server, jump);
         let mut env: Vec<(String, String)> = Vec::new();
         let mut askpass_dir: Option<PathBuf> = None;
 
@@ -215,7 +220,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_key_default_port() {
-        let args = Ssh::build_ssh_args(&key_server());
+        let args = Ssh::build_ssh_args(&key_server(), None);
         assert_eq!(
             args,
             vec![
@@ -232,13 +237,13 @@ mod tests {
         // the "no -p when default" branch.
         let mut s = password_server();
         s.port = 22;
-        let args = Ssh::build_ssh_args(&s);
+        let args = Ssh::build_ssh_args(&s, None);
         assert_eq!(args, vec!["bob@example.com".to_string()]);
     }
 
     #[test]
     fn build_ssh_args_custom_port() {
-        let args = Ssh::build_ssh_args(&password_server());
+        let args = Ssh::build_ssh_args(&password_server(), None);
         assert_eq!(
             args,
             vec![
@@ -251,14 +256,14 @@ mod tests {
 
     #[test]
     fn build_ssh_args_agent_forwarding() {
-        let args = Ssh::build_ssh_args(&forward_server());
+        let args = Ssh::build_ssh_args(&forward_server(), None);
         assert!(args.contains(&"-A".to_string()));
         assert!(args.contains(&"-i".to_string()));
     }
 
     #[test]
     fn build_ssh_argv_starts_with_ssh() {
-        let argv = Ssh::build_ssh_argv(&forward_server());
+        let argv = Ssh::build_ssh_argv(&forward_server(), None);
         assert_eq!(argv.first().map(String::as_str), Some("ssh"));
         assert!(argv.contains(&"-A".to_string()));
     }
@@ -268,10 +273,34 @@ mod tests {
         // Regression: the password must never leak into the argv.
         let mut s = password_server();
         s.key_path = Some("/should-not-see".to_string());
-        let args = Ssh::build_ssh_args(&s);
+        let args = Ssh::build_ssh_args(&s, None);
         let joined = args.join("\n");
         assert!(!joined.contains("hunter2"));
         assert!(!joined.contains("'"));
+    }
+
+    #[test]
+    fn build_ssh_args_with_jump_host() {
+        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"));
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-J".to_string(),
+                "bastion.example.com".to_string(),
+                "alice@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_argv_with_jump_host() {
+        let argv = Ssh::build_ssh_argv(&forward_server(), Some("jump1,jump2"));
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert!(argv.contains(&"-J".to_string()));
+        assert!(argv.contains(&"jump1,jump2".to_string()));
+        assert!(argv.contains(&"-A".to_string()));
     }
 
     #[test]

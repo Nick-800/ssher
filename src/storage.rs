@@ -167,6 +167,83 @@ impl Storage {
         Ok(())
     }
 
+    pub fn validate_jump_host(spec: &str) -> Result<()> {
+        if spec.is_empty() {
+            return Err(SshManagerError::EmptyJumpHost);
+        }
+        if spec.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    ';' | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '`'
+                        | '$'
+                        | '\\'
+                        | '"'
+                        | '\''
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '!'
+                        | '^'
+                        | '~'
+                )
+        }) {
+            return Err(SshManagerError::InvalidJumpHost(spec.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn validate_server_jump(config: &Config, server_name: &str, jump_spec: &str) -> Result<()> {
+        Self::validate_jump_host(jump_spec)?;
+        if jump_spec == server_name {
+            return Err(SshManagerError::SelfReferentialJumpHost(
+                server_name.to_string(),
+            ));
+        }
+        let mut visited = vec![server_name.to_string()];
+        let mut current_spec = jump_spec.to_string();
+        loop {
+            if visited.contains(&current_spec) {
+                let mut cycle_path = visited.clone();
+                cycle_path.push(current_spec);
+                return Err(SshManagerError::JumpHostCycle(cycle_path.join(" -> ")));
+            }
+            if let Some(target) = config.find_server(&current_spec) {
+                visited.push(target.name.clone());
+                if let Some(next) = &target.jump_host {
+                    current_spec = next.clone();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_server_removal(config: &Config, server_name: &str) -> Result<()> {
+        let mut dependents = crate::models::find_jump_dependents(&config.servers, server_name);
+        if !dependents.is_empty() {
+            dependents.sort();
+            return Err(SshManagerError::ServerReferencedAsJumpHost(
+                server_name.to_string(),
+                dependents.join(", "),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn normalize_tags<S: AsRef<str>>(tags: &[S]) -> Result<Vec<String>> {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -204,6 +281,10 @@ impl Storage {
         config.servers[idx] = updated;
 
         let new_name = config.servers[idx].name.clone();
+
+        if old_name != new_name {
+            crate::models::update_jump_host_references(&mut config.servers, &old_name, &new_name);
+        }
 
         // Write new keyring entries first, but only delete old ones after the
         // config is saved, so a failed save can't lose the stored password.
@@ -549,5 +630,111 @@ mod tests {
             !legacy.exists(),
             "legacy file should be removed after migration"
         );
+    }
+
+    #[test]
+    fn validate_jump_host_accepts_valid() {
+        assert!(Storage::validate_jump_host("bastion").is_ok());
+        assert!(Storage::validate_jump_host("jump-1.prod").is_ok());
+        assert!(Storage::validate_jump_host("user@jump.example.com").is_ok());
+        assert!(Storage::validate_jump_host("user@10.0.0.1:2222").is_ok());
+        assert!(Storage::validate_jump_host("jump.example.com:22").is_ok());
+    }
+
+    #[test]
+    fn validate_jump_host_rejects_empty_and_whitespace() {
+        assert!(matches!(
+            Storage::validate_jump_host(""),
+            Err(SshManagerError::EmptyJumpHost)
+        ));
+        assert!(matches!(
+            Storage::validate_jump_host("   "),
+            Err(SshManagerError::InvalidJumpHost(_))
+        ));
+        assert!(matches!(
+            Storage::validate_jump_host("bastion host"),
+            Err(SshManagerError::InvalidJumpHost(_))
+        ));
+    }
+
+    #[test]
+    fn validate_jump_host_rejects_shell_metacharacters() {
+        for ch in [
+            ';', '&', '|', '`', '$', '\\', '"', '\'', '*', '?', '[', ']', '(', ')', '{', '}', '!',
+            '^', '~',
+        ] {
+            let spec = format!("bastion{}host", ch);
+            assert!(
+                matches!(
+                    Storage::validate_jump_host(&spec),
+                    Err(SshManagerError::InvalidJumpHost(_))
+                ),
+                "should reject metacharacter '{}'",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn validate_server_jump_rejects_self_reference() {
+        let cfg = Config::new();
+        assert!(matches!(
+            Storage::validate_server_jump(&cfg, "myserver", "myserver"),
+            Err(SshManagerError::SelfReferentialJumpHost(_))
+        ));
+    }
+
+    #[test]
+    fn validate_server_jump_rejects_cycle() {
+        let mut cfg = Config::new();
+        let mut b = sample_server("B");
+        b.jump_host = Some("A".to_string());
+        cfg.servers.push(b);
+
+        let res = Storage::validate_server_jump(&cfg, "A", "B");
+        assert!(matches!(res, Err(SshManagerError::JumpHostCycle(_))));
+    }
+
+    #[test]
+    fn validate_server_removal_refuses_when_dependents_exist() {
+        let mut cfg = Config::new();
+        let mut s1 = sample_server("s1");
+        s1.jump_host = Some("bastion".to_string());
+        let mut s2 = sample_server("s2");
+        s2.jump_host = Some("bastion".to_string());
+        cfg.servers.push(s1);
+        cfg.servers.push(s2);
+
+        let err = Storage::validate_server_removal(&cfg, "bastion").unwrap_err();
+        assert!(matches!(
+            err,
+            SshManagerError::ServerReferencedAsJumpHost(name, deps)
+                if name == "bastion" && deps == "s1, s2"
+        ));
+
+        // When no dependents, removal validation succeeds
+        assert!(Storage::validate_server_removal(&cfg, "s1").is_ok());
+    }
+
+    #[test]
+    fn execute_server_edit_rename_updates_jump_host_dependents() {
+        let _scope = ScopedConfigDir::new();
+        let mut cfg = Config::new();
+        let s_jump = sample_server("bastion");
+        let mut s_dep = sample_server("app");
+        s_dep.jump_host = Some("bastion".to_string());
+        cfg.servers.push(s_jump);
+        cfg.servers.push(s_dep);
+        Storage::save_config(&cfg).expect("save");
+
+        let edit = ServerEdit {
+            new_name: Some("bastion-v2".to_string()),
+            ..Default::default()
+        };
+        Storage::execute_server_edit(&mut cfg, "bastion", edit, None).expect("edit");
+
+        let loaded = Storage::load_config().expect("load");
+        let app = loaded.find_server("app").expect("app");
+        assert_eq!(app.jump_host.as_deref(), Some("bastion-v2"));
     }
 }

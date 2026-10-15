@@ -72,6 +72,24 @@ pub enum SshManagerError {
 
     #[error("Nothing to change")]
     NothingToChange,
+
+    #[error("Jump host cannot be empty")]
+    EmptyJumpHost,
+
+    #[error("Jump host contains invalid characters: {0}")]
+    InvalidJumpHost(String),
+
+    #[error("Server cannot use itself as a jump host: {0}")]
+    SelfReferentialJumpHost(String),
+
+    #[error("Jump host cycle detected: {0}")]
+    JumpHostCycle(String),
+
+    #[error("Jump host chain exceeds maximum depth of 5")]
+    JumpHostDepthExceeded,
+
+    #[error("Cannot remove server '{0}': referenced as jump host by: {1}")]
+    ServerReferencedAsJumpHost(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;
