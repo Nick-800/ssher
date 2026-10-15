@@ -219,6 +219,8 @@ pub struct Server {
     pub favorite: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +275,7 @@ impl Server {
             forwards: Vec::new(),
             favorite: false,
             last_used: None,
+            tmux: None,
         }
     }
 }
@@ -288,6 +291,7 @@ pub struct ServerEdit {
     pub tags: Option<Vec<String>>,
     pub jump_host: Option<Option<String>>,
     pub forwards: Option<Vec<Forward>>,
+    pub tmux: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -307,6 +311,7 @@ impl ServerEdit {
             && self.tags.is_none()
             && self.jump_host.is_none()
             && self.forwards.is_none()
+            && self.tmux.is_none()
     }
 
     pub fn apply(&self, server: &mut Server, config: &Config) -> Result<()> {
@@ -421,6 +426,12 @@ impl ServerEdit {
             }
             server.forwards = Forward::dedupe(forwards);
         }
+        if let Some(tmux) = &self.tmux {
+            if let Some(session) = tmux {
+                Storage::validate_tmux_session(session)?;
+            }
+            server.tmux = tmux.clone();
+        }
 
         Ok(())
     }
@@ -435,7 +446,7 @@ pub fn format_forwards_summary(forwards: &[Forward]) -> String {
     }
 }
 
-/// Check if a server matches a case-insensitive query across its name, host, tags, jump host, or forwards.
+/// Check if a server matches a case-insensitive query across its name, host, tags, jump host, forwards, or tmux.
 /// An empty query matches every server.
 pub fn server_matches_query(server: &Server, query: &str) -> bool {
     if query.is_empty() {
@@ -454,6 +465,11 @@ pub fn server_matches_query(server: &Server, query: &str) -> bool {
             .forwards
             .iter()
             .any(|f| f.to_string().to_lowercase().contains(&q))
+        || server
+            .tmux
+            .as_ref()
+            .map(|t| t.to_lowercase().contains(&q))
+            .unwrap_or(false)
 }
 
 /// Resolve the `-J` argument for a server, expanding saved servers into `user@host:port`
@@ -1903,12 +1919,44 @@ mod tests {
         };
         assert!(edit_tags_clear.apply(&mut s, &cfg).is_ok());
         assert!(s.tags.is_empty());
+
+        let edit_tmux = ServerEdit {
+            tmux: Some(Some("my-session.1".to_string())),
+            ..Default::default()
+        };
+        assert!(edit_tmux.apply(&mut s, &cfg).is_ok());
+        assert_eq!(s.tmux.as_deref(), Some("my-session.1"));
+
+        let edit_tmux_clear = ServerEdit {
+            tmux: Some(None),
+            ..Default::default()
+        };
+        assert!(edit_tmux_clear.apply(&mut s, &cfg).is_ok());
+        assert_eq!(s.tmux, None);
     }
 
     #[test]
     fn edit_apply_validation_failures() {
         let mut s = sample_server("alpha");
         let cfg = Config::new();
+
+        let bad_tmux = ServerEdit {
+            tmux: Some(Some("bad session with space".to_string())),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_tmux.apply(&mut s, &cfg),
+            Err(SshManagerError::InvalidTmuxSession(_))
+        ));
+
+        let empty_tmux = ServerEdit {
+            tmux: Some(Some("".to_string())),
+            ..Default::default()
+        };
+        assert!(matches!(
+            empty_tmux.apply(&mut s, &cfg),
+            Err(SshManagerError::EmptyTmuxSession)
+        ));
 
         let bad_tag = ServerEdit {
             tags: Some(vec!["invalid tag!".to_string()]),

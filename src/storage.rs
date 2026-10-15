@@ -244,6 +244,21 @@ impl Storage {
         Ok(())
     }
 
+    pub fn validate_tmux_session(session: &str) -> Result<()> {
+        if session.is_empty() {
+            return Err(SshManagerError::EmptyTmuxSession);
+        }
+        if session.len() > 32 {
+            return Err(SshManagerError::TmuxSessionTooLong(session.to_string()));
+        }
+        if session
+            .contains(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.' && c != '-')
+        {
+            return Err(SshManagerError::InvalidTmuxSession(session.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn normalize_tags<S: AsRef<str>>(tags: &[S]) -> Result<Vec<String>> {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -622,6 +637,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_tmux_session_accepts_valid() {
+        assert!(Storage::validate_tmux_session("ssher").is_ok());
+        assert!(Storage::validate_tmux_session("a").is_ok());
+        assert!(Storage::validate_tmux_session("my-session.0_1").is_ok());
+        assert!(Storage::validate_tmux_session("ABC-123.xyz_456").is_ok());
+        let exact_32 = "a".repeat(32);
+        assert!(Storage::validate_tmux_session(&exact_32).is_ok());
+    }
+
+    #[test]
+    fn validate_tmux_session_rejects_empty() {
+        assert!(matches!(
+            Storage::validate_tmux_session(""),
+            Err(SshManagerError::EmptyTmuxSession)
+        ));
+    }
+
+    #[test]
+    fn validate_tmux_session_rejects_too_long() {
+        let too_long = "a".repeat(33);
+        assert!(matches!(
+            Storage::validate_tmux_session(&too_long),
+            Err(SshManagerError::TmuxSessionTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn validate_tmux_session_rejects_invalid_chars() {
+        for bad in [
+            "has space",
+            "session;rm",
+            "session$val",
+            "session/slash",
+            "session:colon",
+            "session'quote",
+            "session\"quote",
+            "session`backtick",
+            "session&and",
+            "session|pipe",
+            "session*star",
+        ] {
+            assert!(
+                matches!(
+                    Storage::validate_tmux_session(bad),
+                    Err(SshManagerError::InvalidTmuxSession(_))
+                ),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn normalize_tags_lowercases_deduplicates_and_preserves_order() {
         let input = vec![
             "Web".to_string(),
@@ -772,6 +839,23 @@ mod tests {
         assert_eq!(loaded.servers[0].name, "srv1");
         assert!(loaded.servers[0].tags.is_empty());
         assert_eq!(loaded.preferred_terminal.as_deref(), Some("xterm"));
+    }
+
+    #[test]
+    fn legacy_servers_without_tmux_still_loads() {
+        let _scope = ScopedConfigDir::new();
+        let servers_file = Storage::get_servers_file().expect("servers path");
+        let legacy_json = r#"{"servers":[{"name":"srv1","host":"srv1.com","username":"bob","port":22,"auth_method":"password","use_agent_forwarding":false}]}"#;
+        fs::write(&servers_file, legacy_json).unwrap();
+
+        let loaded = Storage::load_config().expect("load");
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(loaded.servers[0].name, "srv1");
+        assert_eq!(loaded.servers[0].tmux, None);
+
+        // Verify that round-tripping with None skips serializing tmux
+        let serialized = serde_json::to_string(&loaded).unwrap();
+        assert!(!serialized.contains("tmux"));
     }
 
     #[test]

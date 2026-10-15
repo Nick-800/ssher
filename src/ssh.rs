@@ -12,6 +12,11 @@ pub struct Ssh;
 impl Ssh {
     const KEYRING_SERVICE: &'static str = "ssh_manager";
 
+    /// Build the remote command string to attach or create a tmux session.
+    pub fn build_tmux_command(session: &str) -> String {
+        format!("tmux new-session -A -s {}", session)
+    }
+
     /// Build the argv for `ssh` itself, NOT including any password helper.
     /// The caller is responsible for configuring `SSH_ASKPASS` etc. if the
     /// server uses password authentication.
@@ -19,6 +24,7 @@ impl Ssh {
         server: &Server,
         jump: Option<&str>,
         forwards: &[Forward],
+        remote_command: Option<&str>,
     ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
 
@@ -66,7 +72,16 @@ impl Ssh {
             }
         }
 
+        if remote_command.is_some() {
+            args.push("-t".to_string());
+        }
+
         args.push(format!("{}@{}", server.username, server.host));
+
+        if let Some(cmd) = remote_command {
+            args.push(cmd.to_string());
+        }
+
         args
     }
 
@@ -75,9 +90,10 @@ impl Ssh {
         server: &Server,
         jump: Option<&str>,
         forwards: &[Forward],
+        remote_command: Option<&str>,
     ) -> Vec<String> {
         let mut argv = vec!["ssh".to_string()];
-        argv.extend(Self::build_ssh_args(server, jump, forwards));
+        argv.extend(Self::build_ssh_args(server, jump, forwards, remote_command));
         argv
     }
 
@@ -216,8 +232,9 @@ impl Ssh {
         terminal: &str,
         jump: Option<&str>,
         forwards: &[Forward],
+        remote_command: Option<&str>,
     ) -> Result<()> {
-        let ssh_argv = Self::build_ssh_argv(server, jump, forwards);
+        let ssh_argv = Self::build_ssh_argv(server, jump, forwards, remote_command);
         let mut env: Vec<(String, String)> = Vec::new();
         let mut askpass_dir: Option<PathBuf> = None;
 
@@ -674,7 +691,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_key_default_port() {
-        let args = Ssh::build_ssh_args(&key_server(), None, &[]);
+        let args = Ssh::build_ssh_args(&key_server(), None, &[], None);
         assert_eq!(
             args,
             vec![
@@ -691,13 +708,13 @@ mod tests {
         // the "no -p when default" branch.
         let mut s = password_server();
         s.port = 22;
-        let args = Ssh::build_ssh_args(&s, None, &[]);
+        let args = Ssh::build_ssh_args(&s, None, &[], None);
         assert_eq!(args, vec!["bob@example.com".to_string()]);
     }
 
     #[test]
     fn build_ssh_args_custom_port() {
-        let args = Ssh::build_ssh_args(&password_server(), None, &[]);
+        let args = Ssh::build_ssh_args(&password_server(), None, &[], None);
         assert_eq!(
             args,
             vec![
@@ -710,14 +727,14 @@ mod tests {
 
     #[test]
     fn build_ssh_args_agent_forwarding() {
-        let args = Ssh::build_ssh_args(&forward_server(), None, &[]);
+        let args = Ssh::build_ssh_args(&forward_server(), None, &[], None);
         assert!(args.contains(&"-A".to_string()));
         assert!(args.contains(&"-i".to_string()));
     }
 
     #[test]
     fn build_ssh_argv_starts_with_ssh() {
-        let argv = Ssh::build_ssh_argv(&forward_server(), None, &[]);
+        let argv = Ssh::build_ssh_argv(&forward_server(), None, &[], None);
         assert_eq!(argv.first().map(String::as_str), Some("ssh"));
         assert!(argv.contains(&"-A".to_string()));
     }
@@ -727,7 +744,7 @@ mod tests {
         // Regression: the password must never leak into the argv.
         let mut s = password_server();
         s.key_path = Some("/should-not-see".to_string());
-        let args = Ssh::build_ssh_args(&s, None, &[]);
+        let args = Ssh::build_ssh_args(&s, None, &[], None);
         let joined = args.join("\n");
         assert!(!joined.contains("hunter2"));
         assert!(!joined.contains("'"));
@@ -735,7 +752,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_with_jump_host() {
-        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"), &[]);
+        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"), &[], None);
         assert_eq!(
             args,
             vec![
@@ -750,7 +767,7 @@ mod tests {
 
     #[test]
     fn build_ssh_argv_with_jump_host() {
-        let argv = Ssh::build_ssh_argv(&forward_server(), Some("jump1,jump2"), &[]);
+        let argv = Ssh::build_ssh_argv(&forward_server(), Some("jump1,jump2"), &[], None);
         assert_eq!(argv.first().map(String::as_str), Some("ssh"));
         assert!(argv.contains(&"-J".to_string()));
         assert!(argv.contains(&"jump1,jump2".to_string()));
@@ -764,7 +781,7 @@ mod tests {
             host: "localhost".to_string(),
             host_port: 5432,
         };
-        let args = Ssh::build_ssh_args(&key_server(), None, &[f]);
+        let args = Ssh::build_ssh_args(&key_server(), None, &[f], None);
         assert_eq!(
             args,
             vec![
@@ -787,7 +804,7 @@ mod tests {
             },
             Forward::Dynamic { bind_port: 1080 },
         ];
-        let args = Ssh::build_ssh_args(&key_server(), None, &forwards);
+        let args = Ssh::build_ssh_args(&key_server(), None, &forwards, None);
         assert_eq!(
             args,
             vec![
@@ -798,6 +815,134 @@ mod tests {
                 "-D".to_string(),
                 "1080".to_string(),
                 "alice@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_tmux_command_formats_expected_remote_command() {
+        assert_eq!(
+            Ssh::build_tmux_command("ssher"),
+            "tmux new-session -A -s ssher"
+        );
+        assert_eq!(
+            Ssh::build_tmux_command("work.session-1"),
+            "tmux new-session -A -s work.session-1"
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_command_key_server() {
+        let cmd = Ssh::build_tmux_command("ssher");
+        let args = Ssh::build_ssh_args(&key_server(), None, &[], Some(&cmd));
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-t".to_string(),
+                "alice@example.com".to_string(),
+                "tmux new-session -A -s ssher".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_command_password_auth() {
+        let cmd = Ssh::build_tmux_command("my-session");
+        let args = Ssh::build_ssh_args(&password_server(), None, &[], Some(&cmd));
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "-t".to_string(),
+                "bob@example.com".to_string(),
+                "tmux new-session -A -s my-session".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_command_and_jump() {
+        let cmd = Ssh::build_tmux_command("bastion-session");
+        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"), &[], Some(&cmd));
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-J".to_string(),
+                "bastion.example.com".to_string(),
+                "-t".to_string(),
+                "alice@example.com".to_string(),
+                "tmux new-session -A -s bastion-session".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_command_and_forwards() {
+        let f = Forward::Local {
+            bind_port: 8080,
+            host: "localhost".to_string(),
+            host_port: 80,
+        };
+        let cmd = Ssh::build_tmux_command("dev");
+        let args = Ssh::build_ssh_args(&key_server(), None, &[f], Some(&cmd));
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-L".to_string(),
+                "8080:localhost:80".to_string(),
+                "-t".to_string(),
+                "alice@example.com".to_string(),
+                "tmux new-session -A -s dev".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_command_jump_forwards_and_password() {
+        let f = Forward::Dynamic { bind_port: 1080 };
+        let cmd = Ssh::build_tmux_command("all-features");
+        let args = Ssh::build_ssh_args(
+            &password_server(),
+            Some("jump.example.com"),
+            &[f],
+            Some(&cmd),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-J".to_string(),
+                "jump.example.com".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-D".to_string(),
+                "1080".to_string(),
+                "-t".to_string(),
+                "bob@example.com".to_string(),
+                "tmux new-session -A -s all-features".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_argv_with_remote_command() {
+        let cmd = Ssh::build_tmux_command("ssher");
+        let argv = Ssh::build_ssh_argv(&key_server(), None, &[], Some(&cmd));
+        assert_eq!(
+            argv,
+            vec![
+                "ssh".to_string(),
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-t".to_string(),
+                "alice@example.com".to_string(),
+                "tmux new-session -A -s ssher".to_string(),
             ]
         );
     }

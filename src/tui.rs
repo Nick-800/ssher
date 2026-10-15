@@ -339,7 +339,19 @@ impl Tui {
         let jump = crate::models::resolve_jump(config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
+        let remote_command = if let Some(session) = &server.tmux {
+            Storage::validate_tmux_session(session)?;
+            Some(Ssh::build_tmux_command(session))
+        } else {
+            None
+        };
+        Ssh::launch_connection(
+            server,
+            &terminal_name,
+            jump.as_deref(),
+            &server.forwards,
+            remote_command.as_deref(),
+        )?;
         if let Err(e) = Storage::record_server_launch(&server.name) {
             eprintln!("Warning: failed to save last used timestamp: {}", e);
         }
@@ -572,6 +584,21 @@ impl Tui {
             Some(Storage::normalize_forwards(&specs)?)
         };
 
+        let current_tmux_desc = server.tmux.as_deref().unwrap_or("none");
+        print!("Tmux session [{}]: ", current_tmux_desc);
+        io::stdout().flush()?;
+        let mut tmux_str = String::new();
+        io::stdin().read_line(&mut tmux_str)?;
+        let tmux_trimmed = tmux_str.trim();
+        let tmux = if tmux_trimmed.is_empty() {
+            None
+        } else if tmux_trimmed == "-" {
+            Some(None)
+        } else {
+            Storage::validate_tmux_session(tmux_trimmed)?;
+            Some(Some(tmux_trimmed.to_string()))
+        };
+
         let edit = ServerEdit {
             new_name,
             host,
@@ -582,6 +609,7 @@ impl Tui {
             tags,
             jump_host,
             forwards,
+            tmux,
         };
 
         let mut config = Storage::load_config()?;
@@ -851,21 +879,44 @@ impl Tui {
             .alignment(Alignment::Center);
             f.render_widget(no_match_msg, chunks[1]);
         } else {
-            let col_header = format!(
-                "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
-                "NAME",
-                "HOST",
-                "USER",
-                "PORT",
-                "AUTH",
-                "AGENT FW",
-                "VIA",
-                "FWD",
-                "FAV",
-                "LAST USED",
-                "TAGS"
-            );
-            let separator = format!("  {}", "─".repeat(116));
+            let show_tmux = f.size().width >= 125;
+            let col_header = if show_tmux {
+                format!(
+                    "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<8} {:<5} {:<11} {}",
+                    "NAME",
+                    "HOST",
+                    "USER",
+                    "PORT",
+                    "AUTH",
+                    "AGENT FW",
+                    "VIA",
+                    "FWD",
+                    "TMUX",
+                    "FAV",
+                    "LAST USED",
+                    "TAGS"
+                )
+            } else {
+                format!(
+                    "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
+                    "NAME",
+                    "HOST",
+                    "USER",
+                    "PORT",
+                    "AUTH",
+                    "AGENT FW",
+                    "VIA",
+                    "FWD",
+                    "FAV",
+                    "LAST USED",
+                    "TAGS"
+                )
+            };
+            let separator = if show_tmux {
+                format!("  {}", "─".repeat(125))
+            } else {
+                format!("  {}", "─".repeat(116))
+            };
 
             let mut items = Vec::new();
             items.push(
@@ -886,6 +937,7 @@ impl Tui {
                 let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
                 let via_str = s.jump_host.as_deref().unwrap_or("-");
                 let fwd_str = crate::models::format_forwards_summary(&s.forwards);
+                let tmux_str = s.tmux.as_deref().unwrap_or("-");
                 let fav_str = if s.favorite { "*" } else { "-" };
                 let now = crate::models::current_time_epoch_secs();
                 let last_used_str = crate::models::format_last_used(s.last_used, now);
@@ -895,31 +947,32 @@ impl Tui {
                     s.tags.join(", ")
                 };
 
-                if view_idx == selected_index {
-                    let line = format!(
-                        "▶ {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
-                        s.name,
-                        s.host,
-                        s.username,
-                        s.port,
-                        auth_str,
-                        af_str,
-                        via_str,
-                        fwd_str,
-                        fav_str,
-                        last_used_str,
-                        tags_str
-                    );
-                    items.push(
-                        ListItem::new(line).style(
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    );
+                let marker = if view_idx == selected_index {
+                    "▶"
                 } else {
-                    let line = format!(
-                        "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
+                    " "
+                };
+                let line = if show_tmux {
+                    format!(
+                        "{} {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<8} {:<5} {:<11} {}",
+                        marker,
+                        s.name,
+                        s.host,
+                        s.username,
+                        s.port,
+                        auth_str,
+                        af_str,
+                        via_str,
+                        fwd_str,
+                        tmux_str,
+                        fav_str,
+                        last_used_str,
+                        tags_str
+                    )
+                } else {
+                    format!(
+                        "{} {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
+                        marker,
                         s.name,
                         s.host,
                         s.username,
@@ -931,15 +984,35 @@ impl Tui {
                         fav_str,
                         last_used_str,
                         tags_str
-                    );
-                    items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
-                }
+                    )
+                };
+
+                let item_style = if view_idx == selected_index {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                items.push(ListItem::new(line).style(item_style));
             }
 
             let mut list_state = ratatui::widgets::ListState::default();
             list_state.select(Some(selected_index + 2));
+            let selected_server = filtered_indices
+                .get(selected_index)
+                .map(|&real_idx| &config.servers[real_idx]);
+            let block_title = if !show_tmux {
+                if let Some(tmux) = selected_server.and_then(|s| s.tmux.as_deref()) {
+                    format!("Servers [tmux: {}]", tmux)
+                } else {
+                    "Servers".to_string()
+                }
+            } else {
+                "Servers".to_string()
+            };
             let list_widget =
-                List::new(items).block(Block::default().title("Servers").borders(Borders::ALL));
+                List::new(items).block(Block::default().title(block_title).borders(Borders::ALL));
             f.render_stateful_widget(list_widget, chunks[1], &mut list_state);
         }
 
@@ -1087,10 +1160,10 @@ impl Tui {
         }
 
         println!(
-            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
-            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Fwd", "Tags"
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<10} {:<20}",
+            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Fwd", "Tmux", "Tags"
         );
-        println!("{}", "─".repeat(131));
+        println!("{}", "─".repeat(142));
 
         for server in &config.servers {
             let auth = match server.auth_method {
@@ -1104,6 +1177,7 @@ impl Tui {
             };
             let via_str = server.jump_host.as_deref().unwrap_or("-");
             let fwd_str = crate::models::format_forwards_summary(&server.forwards);
+            let tmux_str = server.tmux.as_deref().unwrap_or("-");
             let tags_str = if server.tags.is_empty() {
                 "-".to_string()
             } else {
@@ -1111,7 +1185,7 @@ impl Tui {
             };
 
             println!(
-                "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
+                "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<10} {:<20}",
                 server.name,
                 server.host,
                 server.username,
@@ -1120,6 +1194,7 @@ impl Tui {
                 agent_fw,
                 via_str,
                 fwd_str,
+                tmux_str,
                 tags_str
             );
         }
@@ -1244,6 +1319,18 @@ impl Tui {
             Storage::normalize_forwards(&specs)?
         };
 
+        print!("Tmux session (optional): ");
+        io::stdout().flush()?;
+        let mut tmux_str = String::new();
+        io::stdin().read_line(&mut tmux_str)?;
+        let tmux_trimmed = tmux_str.trim();
+        let tmux = if tmux_trimmed.is_empty() || tmux_trimmed == "-" {
+            None
+        } else {
+            Storage::validate_tmux_session(tmux_trimmed)?;
+            Some(tmux_trimmed.to_string())
+        };
+
         let mut server = Server::new(
             name.to_string(),
             host.to_string(),
@@ -1256,6 +1343,7 @@ impl Tui {
         server.tags = tags;
         server.jump_host = jump_host;
         server.forwards = forwards;
+        server.tmux = tmux;
 
         config.servers.push(server);
         Storage::save_config(&config)?;
@@ -1298,7 +1386,19 @@ impl Tui {
         let jump = crate::models::resolve_jump(&config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
+        let remote_command = if let Some(session) = &server.tmux {
+            Storage::validate_tmux_session(session)?;
+            Some(Ssh::build_tmux_command(session))
+        } else {
+            None
+        };
+        Ssh::launch_connection(
+            server,
+            &terminal_name,
+            jump.as_deref(),
+            &server.forwards,
+            remote_command.as_deref(),
+        )?;
         if let Err(e) = Storage::record_server_launch(&server.name) {
             eprintln!("Warning: failed to save last used timestamp: {}", e);
         }

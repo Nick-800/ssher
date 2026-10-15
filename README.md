@@ -8,6 +8,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Flexible Authentication**: Support both SSH key and password-based authentication
 - **Jump Host / ProxyJump**: Support for bastion/jump hosts via saved server references or raw SSH jump specs, with chain resolution and cycle detection
 - **Port Forwarding Presets**: Local (-L), Remote (-R), and Dynamic (-D) port forwarding presets and ad-hoc connection forwards with port shorthand support
+- **tmux Session Attach**: Attach or create remote tmux sessions automatically on connection with per-server defaults, ad-hoc session overrides, and interactive TUI prompts
 - **Tags & Filtering**: Organize servers with tags, filter by tag sets, and search tags in the browser
 - **Favourites & Recency Tracking**: Mark servers as favourites, track last used connection timestamps, and sort by recent usage or alphabetically
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
@@ -94,6 +95,9 @@ ssher add web-server 10.0.0.7 admin --key /path/to/key \
   --forward L:8080:localhost:80 \
   --forward R:2222:localhost:22 \
   --forward D:1080
+
+# Add a server with a default tmux session
+ssher add dev-server 10.0.0.8 developer --key /path/to/key --tmux dev
 ```
 
 ### List All Servers
@@ -115,11 +119,11 @@ ssher list --tag prod --tag web
 
 Output:
 ```
-Name                 Host                 Username        Port       Auth         Agent FW   Via              Fwd      Fav   Last used    Tags
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-myserver             example.com          username        22         key          no         -                1        *     3h ago       prod, web
-internal-node        10.0.0.5             admin           22         key          no         bastion          -        -     never        -
-prod-server          prod.example.com     root            22         password     yes        -                -        -     never        -
+Name                 Host                 Username        Port       Auth         Agent FW   Via              Fwd      Tmux       Fav   Last used    Tags
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myserver             example.com          username        22         key          no         -                1        -          *     3h ago       prod, web
+internal-node        10.0.0.5             admin           22         key          no         bastion          -        dev        -     never        -
+prod-server          prod.example.com     root            22         password     yes        -                -        -          -     never        -
 ```
 
 ### Favorite and Unfavorite Servers
@@ -149,6 +153,8 @@ Options:
 - `-c`, `--current`: Connect directly in the current terminal instead of spawning an external window
 - `--forward <spec>`: Add ad-hoc port forwarding for this connection only (repeatable; accepts `L:<bind>:<host>:<port>`, `R:<bind>:<host>:<port>`, `D:<port>`, or bare port shorthand like `5432`)
 - `--no-forwards`: Do not apply saved port forwarding presets for this connection
+- `--tmux [<session>]`: Attach to or create a remote tmux session (`tmux new-session -A -s <session>`) with allocated TTY (`-t`). Defaults to `ssher` if session name is omitted
+- `--no-tmux`: Do not attach to saved default tmux session for this connection
 
 Ad-hoc port forwarding and bypassing presets:
 ```bash
@@ -157,6 +163,15 @@ ssher connect myserver --forward 8080 --forward D:1080
 
 # Connect without applying saved presets:
 ssher connect myserver --no-forwards
+
+# Connect and attach to remote tmux session (default name 'ssher'):
+ssher connect myserver --tmux
+
+# Connect with a custom tmux session name:
+ssher connect myserver --tmux custom-work
+
+# Connect without attaching to saved default tmux session:
+ssher connect myserver --no-tmux
 ```
 
 This will:
@@ -344,6 +359,12 @@ ssher edit myserver --forward 5432 --forward D:1080
 
 # Clear all port forwarding presets
 ssher edit myserver --clear-forwards
+
+# Set or update default tmux session
+ssher edit myserver --tmux dev
+
+# Clear default tmux session
+ssher edit myserver --clear-tmux
 ```
 
 ### Remove a Server
@@ -420,17 +441,17 @@ ssher
 
 Select **Browse Servers** to open the in-terminal server browser.
 
-The browser displays jump hosts, port forward presets count, favorite status, last used timestamp, and tags in dedicated `VIA`, `FWD`, `FAV`, `LAST USED`, and `TAGS` columns for quick visibility.
+The browser displays jump hosts, port forward presets count, tmux session, favorite status, last used timestamp, and tags in dedicated `VIA`, `FWD`, `TMUX` (on displays with width >= 125, or detailed in the title block), `FAV`, `LAST USED`, and `TAGS` columns for quick visibility.
 
 #### Browser Keybindings:
 - `j` / `k` or `↓` / `↑`: Move selection up/down
-- `Enter`: Connect to selected server (automatically routing through configured jump hosts and port forwards)
-- `a`: Add a new server (prompts include comma-separated tags, optional jump host, and comma-separated port forwards)
-- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host or port forwards)
+- `Enter`: Connect to selected server (automatically routing through configured jump hosts, port forwards, and tmux session attach)
+- `a`: Add a new server (prompts include comma-separated tags, optional jump host, comma-separated port forwards, and optional tmux session)
+- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host, port forwards, or tmux session)
 - `d`: Delete selected server (with y/n confirmation; blocked if referenced as a jump host)
 - `f`: Toggle favorite status for selected server (re-sorts favourites to top and keeps selection pointed at the server)
 - `p`: Ping highlighted server for TCP reachability and display health check status
-- `/`: Filter servers by name, host, tags, jump host, or port forwards (case-insensitive substring)
+- `/`: Filter servers by name, host, tags, jump host, port forwards, or tmux session (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
 
@@ -514,7 +535,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub|--tmux)
             _ssher "$@"
             return 0
             ;;
@@ -621,7 +642,8 @@ All configuration is stored in `~/.config/ssh_manager/`:
     "jump_host": "bastion",
     "forwards": [
       "L:5432:localhost:5432"
-    ]
+    ],
+    "tmux": "main"
   },
   {
     "name": "prod-server",
@@ -662,6 +684,8 @@ The application provides clear error messages for common issues:
 - `Jump host cycle detected: ...` — Jump host chains cannot form a cycle
 - `Jump host chain exceeds maximum depth of 5 hops` — Jump chains cannot exceed 5 hops
 - `Invalid port forwarding specification: ...` — Forward specification is malformed or port is outside 1-65535
+- `Tmux session name cannot be empty` — Tmux session name must contain at least one character
+- `Invalid tmux session name '...': must be 1-32 characters of [A-Za-z0-9_.-]` — Session name contains invalid characters or exceeds 32 characters
 - `scp is not installed. Please install OpenSSH client tools` — `scp` was not found in PATH
 - `Local source file not found: ...` — Local file or directory specified for upload does not exist
 - `At least one source and a destination must be specified` — Missing source or destination argument
@@ -678,6 +702,7 @@ ssher add <name> <host> <username> [OPTIONS]
   --tag <tag>                  Server tag (repeatable)
   --jump <spec>                Jump host (saved server name or [user@]host[:port])
   --forward <spec>             Port forward preset (repeatable; L:..., R:..., D:..., or port shorthand)
+  --tmux <session>             Default tmux session name (1-32 chars of [A-Za-z0-9_.-])
 
 # Edit a server
 ssher edit <name> [OPTIONS]
@@ -694,6 +719,8 @@ ssher edit <name> [OPTIONS]
   --clear-jump                 Clear jump host from server
   --forward <spec>             Set port forwarding presets (repeatable, replaces current forwards)
   --clear-forwards             Clear all port forwarding presets from server
+  --tmux <session>             Set default tmux session name
+  --clear-tmux                 Clear default tmux session from server
 
 # List servers
 ssher list [OPTIONS]
@@ -709,6 +736,8 @@ ssher connect <name> [OPTIONS]
   -c, --current                 Connect inline in current terminal
   --forward <spec>             Ad-hoc port forward for this connection (repeatable)
   --no-forwards                Do not apply saved port forwarding presets
+  --tmux [<session>]           Attach/create remote tmux session (default: ssher)
+  --no-tmux                    Do not attach to saved tmux session
 
 # Execute one-off remote command inline in current terminal
 ssher exec <target> -- <command...>

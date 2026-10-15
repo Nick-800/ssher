@@ -60,6 +60,9 @@ enum Commands {
         /// Port forwarding preset (repeatable, e.g. 5432, L:8080:localhost:80, R:2222:host:22, D:1080)
         #[arg(long = "forward", action = clap::ArgAction::Append)]
         forward: Vec<String>,
+        /// Default tmux session name to attach on connect
+        #[arg(long = "tmux")]
+        tmux: Option<String>,
     },
 
     /// Modify a saved SSH server
@@ -105,6 +108,12 @@ enum Commands {
         /// Clear all port forwarding presets from server
         #[arg(long, conflicts_with = "forward")]
         clear_forwards: bool,
+        /// Set default tmux session name to attach on connect
+        #[arg(long = "tmux", conflicts_with = "clear_tmux")]
+        tmux: Option<String>,
+        /// Clear default tmux session name from server
+        #[arg(long, conflicts_with = "tmux")]
+        clear_tmux: bool,
     },
 
     /// List all saved SSH servers
@@ -130,6 +139,17 @@ enum Commands {
         /// Do not apply saved port forwarding presets
         #[arg(long = "no-forwards")]
         no_forwards: bool,
+        /// Attach to a tmux session (defaults to "ssher")
+        #[arg(
+            long = "tmux",
+            num_args = 0..=1,
+            default_missing_value = "ssher",
+            conflicts_with = "no_tmux"
+        )]
+        tmux: Option<String>,
+        /// Do not attach to a tmux session
+        #[arg(long = "no-tmux", conflicts_with = "tmux")]
+        no_tmux: bool,
     },
 
     /// Execute a remote command inline in the current terminal
@@ -340,6 +360,7 @@ fn run(cli: Cli) -> Result<()> {
             tag,
             jump,
             forward,
+            tmux,
         } => add_server(
             name,
             AddArgs {
@@ -352,6 +373,7 @@ fn run(cli: Cli) -> Result<()> {
                 tags: tag,
                 jump,
                 forwards: forward,
+                tmux,
             },
         ),
         Commands::Edit {
@@ -369,6 +391,8 @@ fn run(cli: Cli) -> Result<()> {
             clear_jump,
             forward,
             clear_forwards,
+            tmux,
+            clear_tmux,
         } => {
             let tags = if clear_tags { Some(Vec::new()) } else { tag };
             let jump_host = if clear_jump {
@@ -383,6 +407,11 @@ fn run(cli: Cli) -> Result<()> {
                     .map(|f| Storage::normalize_forwards(&f))
                     .transpose()?
             };
+            let tmux = if clear_tmux {
+                Some(None)
+            } else {
+                tmux.map(Some)
+            };
             edit_server(
                 name,
                 EditArgs {
@@ -396,6 +425,7 @@ fn run(cli: Cli) -> Result<()> {
                     tags,
                     jump_host,
                     forwards,
+                    tmux,
                 },
             )
         }
@@ -405,7 +435,9 @@ fn run(cli: Cli) -> Result<()> {
             current,
             forward,
             no_forwards,
-        } => connect_server(&name, current, &forward, no_forwards),
+            tmux,
+            no_tmux,
+        } => connect_server(&name, current, &forward, no_forwards, tmux, no_tmux),
         Commands::Exec {
             target,
             tag,
@@ -472,6 +504,7 @@ struct AddArgs {
     tags: Vec<String>,
     jump: Option<String>,
     forwards: Vec<String>,
+    tmux: Option<String>,
 }
 
 fn add_server(name: String, args: AddArgs) -> Result<()> {
@@ -482,6 +515,9 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     Storage::validate_port(args.port)?;
     let normalized_tags = Storage::normalize_tags(&args.tags)?;
     let normalized_forwards = Storage::normalize_forwards(&args.forwards)?;
+    if let Some(session) = &args.tmux {
+        Storage::validate_tmux_session(session)?;
+    }
 
     let mut config = Storage::load_config()?;
 
@@ -541,6 +577,7 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     server.tags = normalized_tags;
     server.jump_host = args.jump;
     server.forwards = normalized_forwards;
+    server.tmux = args.tmux;
 
     config.servers.push(server);
     Storage::save_config(&config)?;
@@ -586,7 +623,7 @@ fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
     let now = models::current_time_epoch_secs();
 
     println!(
-        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<5} {:<12} {:<20}",
+        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<10} {:<5} {:<12} {:<20}",
         "Name",
         "Host",
         "Username",
@@ -595,11 +632,12 @@ fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
         "Agent FW",
         "Via",
         "Fwd",
+        "Tmux",
         "Fav",
         "Last used",
         "Tags"
     );
-    println!("{}", "─".repeat(150));
+    println!("{}", "─".repeat(161));
 
     for server in matching_servers {
         let auth = match server.auth_method {
@@ -613,6 +651,7 @@ fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
         };
         let via_str = server.jump_host.as_deref().unwrap_or("-");
         let fwd_str = models::format_forwards_summary(&server.forwards);
+        let tmux_str = server.tmux.as_deref().unwrap_or("-");
         let fav_str = if server.favorite { "*" } else { "-" };
         let last_used_str = models::format_last_used(server.last_used, now);
         let tags_str = if server.tags.is_empty() {
@@ -622,7 +661,7 @@ fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
         };
 
         println!(
-            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<5} {:<12} {:<20}",
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<10} {:<5} {:<12} {:<20}",
             server.name,
             server.host,
             server.username,
@@ -631,6 +670,7 @@ fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
             agent_fw,
             via_str,
             fwd_str,
+            tmux_str,
             fav_str,
             last_used_str,
             tags_str
@@ -668,6 +708,7 @@ struct EditArgs {
     tags: Option<Vec<String>>,
     jump_host: Option<Option<String>>,
     forwards: Option<Vec<models::Forward>>,
+    tmux: Option<Option<String>>,
 }
 
 fn edit_server(name: String, args: EditArgs) -> Result<()> {
@@ -681,6 +722,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         && args.tags.is_none()
         && args.jump_host.is_none()
         && args.forwards.is_none()
+        && args.tmux.is_none()
     {
         return Err(error::SshManagerError::NothingToChange);
     }
@@ -721,6 +763,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         tags: args.tags,
         jump_host: args.jump_host,
         forwards: args.forwards,
+        tmux: args.tmux,
     };
 
     Storage::execute_server_edit(&mut config, &name, edit, new_password)?;
@@ -732,6 +775,8 @@ fn connect_server(
     force_current: bool,
     adhoc_specs: &[String],
     no_forwards: bool,
+    adhoc_tmux: Option<String>,
+    no_tmux: bool,
 ) -> Result<()> {
     let config = Storage::load_config()?;
 
@@ -752,6 +797,19 @@ fn connect_server(
         }
     }
 
+    let effective_tmux = if no_tmux {
+        None
+    } else {
+        adhoc_tmux.as_deref().or(server.tmux.as_deref())
+    };
+
+    let remote_command = if let Some(session) = effective_tmux {
+        Storage::validate_tmux_session(session)?;
+        Some(Ssh::build_tmux_command(session))
+    } else {
+        None
+    };
+
     // Get terminal to use
     let terminal_name = if force_current {
         "current".to_string()
@@ -761,7 +819,13 @@ fn connect_server(
 
     println!("Connecting to {}...", server.name);
     let server_name = server.name.clone();
-    Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &effective_forwards)?;
+    Ssh::launch_connection(
+        server,
+        &terminal_name,
+        jump.as_deref(),
+        &effective_forwards,
+        remote_command.as_deref(),
+    )?;
     if let Err(e) = Storage::record_server_launch(&server_name) {
         eprintln!("Warning: failed to save last used timestamp: {}", e);
     }
@@ -1225,7 +1289,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub|--tmux)
             _ssher "$@"
             return 0
             ;;
@@ -1436,6 +1500,8 @@ mod tests {
                 clear_jump,
                 forward,
                 clear_forwards,
+                tmux,
+                clear_tmux,
             } => {
                 assert_eq!(name, "myserver");
                 assert_eq!(host.as_deref(), Some("example.com"));
@@ -1451,6 +1517,8 @@ mod tests {
                 assert!(!clear_jump);
                 assert_eq!(forward, None);
                 assert!(!clear_forwards);
+                assert_eq!(tmux, None);
+                assert!(!clear_tmux);
             }
             _ => panic!("expected Commands::Edit"),
         }
@@ -1604,11 +1672,15 @@ mod tests {
                 current,
                 forward,
                 no_forwards,
+                tmux,
+                no_tmux,
             } => {
                 assert_eq!(name, "prod");
                 assert!(!current);
                 assert!(forward.is_empty());
                 assert!(!no_forwards);
+                assert_eq!(tmux, None);
+                assert!(!no_tmux);
             }
             _ => panic!("expected Commands::Connect"),
         }
@@ -1782,6 +1854,69 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_connect_tmux_flag_no_val() {
+        let cli = Cli::try_parse_from(["ssher", "connect", "prod", "--tmux"]).unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                tmux,
+                no_tmux,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(tmux.as_deref(), Some("ssher"));
+                assert!(!no_tmux);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_connect_tmux_flag_with_val() {
+        let cli = Cli::try_parse_from(["ssher", "connect", "prod", "--tmux", "work"]).unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                tmux,
+                no_tmux,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(tmux.as_deref(), Some("work"));
+                assert!(!no_tmux);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_connect_no_tmux() {
+        let cli = Cli::try_parse_from(["ssher", "connect", "prod", "--no-tmux"]).unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                tmux,
+                no_tmux,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(tmux, None);
+                assert!(no_tmux);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_connect_tmux_and_no_tmux_conflict() {
+        let res = Cli::try_parse_from(["ssher", "connect", "prod", "--tmux", "--no-tmux"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn cli_parse_completions_subcommand() {
         for (shell_arg, expected) in [
             ("bash", clap_complete::Shell::Bash),
@@ -1839,6 +1974,7 @@ mod tests {
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
         assert!(bash.contains("--sort"));
+        assert!(bash.contains("--tmux"));
         assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id|put|get|ping"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
@@ -1879,6 +2015,29 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_add_tmux() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "add",
+            "srv",
+            "1.2.3.4",
+            "root",
+            "--key",
+            "/key",
+            "--tmux",
+            "my-session",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Add { tmux, .. } => {
+                assert_eq!(tmux.as_deref(), Some("my-session"));
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
     fn cli_parse_edit_jump() {
         let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--jump", "user@proxy:22"]).unwrap();
 
@@ -1912,6 +2071,44 @@ mod tests {
     fn cli_parse_edit_jump_and_clear_jump_conflict() {
         assert!(
             Cli::try_parse_from(["ssher", "edit", "srv", "--jump", "bastion", "--clear-jump"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parse_edit_tmux() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--tmux", "session2"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                tmux, clear_tmux, ..
+            } => {
+                assert_eq!(tmux.as_deref(), Some("session2"));
+                assert!(!clear_tmux);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_clear_tmux() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--clear-tmux"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                tmux, clear_tmux, ..
+            } => {
+                assert_eq!(tmux, None);
+                assert!(clear_tmux);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_tmux_and_clear_tmux_conflict() {
+        assert!(
+            Cli::try_parse_from(["ssher", "edit", "srv", "--tmux", "sess", "--clear-tmux"])
                 .is_err()
         );
     }

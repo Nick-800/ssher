@@ -108,6 +108,15 @@ pub enum SshManagerError {
 
     #[error("No servers match")]
     NoServersMatch,
+
+    #[error("Tmux session name cannot be empty")]
+    EmptyTmuxSession,
+
+    #[error("Tmux session name contains invalid characters: {0}")]
+    InvalidTmuxSession(String),
+
+    #[error("Tmux session name exceeds maximum length of 32 characters: {0}")]
+    TmuxSessionTooLong(String),
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;
