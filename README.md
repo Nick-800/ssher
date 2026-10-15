@@ -18,6 +18,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Remote Command Execution**: Run one-off remote commands inline (`ssher exec`) on single servers, tag sets, or all servers with sequential execution and BatchMode protection
 - **Public Key Installation**: Install public SSH keys on saved servers (`ssher copy-id`), with jump host support, `SSH_ASKPASS` password delivery, and optional switching to key authentication (`--switch-to-key`)
 - **File Transfer (SCP)**: Upload and download files or directories (`ssher put` and `ssher get`) wrapping `scp` with recursive transfer (`-r`), jump host support, `SSH_ASKPASS` password delivery, and automatic IPv6 formatting
+- **Health Check (TCP Ping)**: Check TCP reachability (`ssher ping`) of saved servers' host:port concurrently (capped at 16 threads), reporting connection latency, refused, timeout, or DNS failure with non-zero exit code on failure, plus single-server ping in the TUI browser (`p`)
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -274,6 +275,36 @@ ssher get -r myserver /var/www/uploads ./downloads/
 - Safe path handling: Local paths starting with `-` are protected with `./` prefixing and passed after `--` to prevent flag injection.
 - Password authentication: Securely reuses the temporary `SSH_ASKPASS` helper. Passwords are read from the OS keyring and never appear on the command line or in the process table.
 
+### Ping / Health Check
+
+Check TCP reachability of saved servers' `host:port` without SSH login:
+
+```bash
+# Ping all configured servers concurrently (capped at 16 threads)
+ssher ping
+
+# Ping a specific server by name or unique prefix
+ssher ping myserver
+
+# Ping servers matching all specified tags
+ssher ping --tag prod --tag web
+
+# Ping with custom connection timeout in seconds (default: 3)
+ssher ping --timeout 5
+```
+
+Output:
+```
+myserver    example.com:22   OK 12ms
+db-server   10.0.0.6:5432    refused
+old-box     10.0.0.99:22     timeout
+invalid-box bad.host:22      dns error
+up 1 / down 3
+```
+
+Results are printed in list order: `name  host:port  OK <ms>ms | refused | timeout | dns error`.
+If any checked server is down (`refused`, `timeout`, or `dns error`), `ssher ping` exits with a non-zero exit code (1).
+
 ### Edit a Server
 
 Modify an existing server configuration in place:
@@ -360,6 +391,7 @@ The browser displays jump hosts, port forward presets count, favorite status, la
 - `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host or port forwards)
 - `d`: Delete selected server (with y/n confirmation; blocked if referenced as a jump host)
 - `f`: Toggle favorite status for selected server (re-sorts favourites to top and keeps selection pointed at the server)
+- `p`: Ping highlighted server for TCP reachability and display health check status
 - `/`: Filter servers by name, host, tags, jump host, or port forwards (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
@@ -646,6 +678,11 @@ ssher exec --tag <tag> [--tag <tag2>] -- <command...>
 ssher exec --all -- <command...>
   --tag <tag>                   Filter servers by tag (repeatable, must match all)
   --all                         Run on all configured servers
+
+# Check TCP reachability of servers
+ssher ping [<name>] [OPTIONS]
+  --tag <tag>                   Filter servers by tag (repeatable, must match all)
+  --timeout <secs>              Connection timeout in seconds (default: 3)
 
 # Install public key on server (wrapping ssh-copy-id)
 ssher copy-id <name> [OPTIONS]

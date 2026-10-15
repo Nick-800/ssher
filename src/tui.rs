@@ -297,6 +297,39 @@ impl Tui {
         Ok(())
     }
 
+    fn ping_server_browser(server: &Server) -> Result<()> {
+        println!("\n{}", "=".repeat(60));
+        println!("{:^60}", format!("PING SERVER: {}", server.name));
+        println!("{}", "=".repeat(60));
+        println!(
+            "\nChecking TCP reachability for {}:{} (timeout 3s)...\n",
+            server.host, server.port
+        );
+        io::stdout().flush()?;
+
+        let results = crate::models::ping_servers(&[server], Duration::from_secs(3));
+        let mut up_count = 0;
+        let mut down_count = 0;
+
+        for res in &results {
+            if res.is_up() {
+                up_count += 1;
+            } else {
+                down_count += 1;
+            }
+            println!(
+                "{}",
+                crate::models::format_ping_result(&res.name, &res.host, res.port, &res.status)
+            );
+        }
+
+        println!(
+            "{}",
+            crate::models::format_ping_summary(up_count, down_count)
+        );
+        Ok(())
+    }
+
     fn connect_to_server(server: &Server, config: &Config) -> Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("{:^60}", "CONNECT TO SERVER");
@@ -688,6 +721,14 @@ impl Tui {
                                 }
                                 needs_browser_redraw = true;
                             }
+                            KeyCode::Char('p') if !filtered_indices.is_empty() => {
+                                let server =
+                                    config.servers[filtered_indices[selected_index]].clone();
+                                Self::run_in_plain_screen(terminal, || {
+                                    Self::ping_server_browser(&server)
+                                })?;
+                                needs_browser_redraw = true;
+                            }
                             KeyCode::Char('/') => {
                                 mode = BrowserMode::Filter;
                                 needs_browser_redraw = true;
@@ -961,6 +1002,13 @@ impl Tui {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" Fav • "),
+                    Span::styled(
+                        "p",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Ping • "),
                     Span::styled(
                         "/",
                         Style::default()

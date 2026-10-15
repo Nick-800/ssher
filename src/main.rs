@@ -238,6 +238,21 @@ enum Commands {
         shell: clap_complete::Shell,
     },
 
+    /// Check TCP reachability of saved servers
+    Ping {
+        /// Server name to ping
+        #[arg(conflicts_with = "tag")]
+        name: Option<String>,
+
+        /// Filter servers by tag (repeatable, must have all tags)
+        #[arg(long = "tag", conflicts_with = "name", action = clap::ArgAction::Append)]
+        tag: Vec<String>,
+
+        /// Connection timeout in seconds (default: 3)
+        #[arg(long, default_value = "3")]
+        timeout: u64,
+    },
+
     #[command(name = "__complete-servers", hide = true)]
     CompleteServers,
 
@@ -402,6 +417,7 @@ fn run(cli: Cli) -> Result<()> {
             skip_existing,
         }),
         Commands::Completions { shell } => generate_completions(shell),
+        Commands::Ping { name, tag, timeout } => ping_servers_cli(name.as_deref(), &tag, timeout),
         Commands::CompleteServers => complete_servers(),
         Commands::CompleteTags => complete_tags(),
         Commands::Config {
@@ -794,6 +810,42 @@ fn exec_servers(
     }
 }
 
+fn ping_servers_cli(name: Option<&str>, tags: &[String], timeout_secs: u64) -> Result<()> {
+    if timeout_secs == 0 {
+        return Err(error::SshManagerError::InvalidConfig(
+            "Timeout must be greater than 0".to_string(),
+        ));
+    }
+
+    let config = Storage::load_config()?;
+    let targets = models::select_ping_targets(&config.servers, name, tags)?;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let results = models::ping_servers(&targets, timeout);
+
+    let mut up_count = 0;
+    let mut down_count = 0;
+
+    for res in &results {
+        if res.is_up() {
+            up_count += 1;
+        } else {
+            down_count += 1;
+        }
+        println!(
+            "{}",
+            models::format_ping_result(&res.name, &res.host, res.port, &res.status)
+        );
+    }
+
+    println!("{}", models::format_ping_summary(up_count, down_count));
+
+    if down_count > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 struct CopyIdArgs {
     explicit_key: Option<String>,
     switch_to_key: bool,
@@ -1107,7 +1159,7 @@ _ssher_complete() {
     local subcmd_idx=0
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove|fav|unfav|exec|copy-id|put|get)
+            connect|edit|remove|fav|unfav|exec|copy-id|put|get|ping)
                 subcmd="${COMP_WORDS[i]}"
                 subcmd_idx=$i
                 break
@@ -1148,8 +1200,8 @@ fi
         }
         clap_complete::Shell::Fish => {
             let fish_snippet = r#"
-# Dynamic server completion for connect, edit, remove, fav, unfav, exec, copy-id, put, get
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec copy-id put get" -f -a "(ssher __complete-servers)"
+# Dynamic server completion for connect, edit, remove, fav, unfav, exec, copy-id, put, get, ping
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec copy-id put get ping" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 complete -c ssher -l sort -f -a "recent name"
@@ -1189,6 +1241,14 @@ complete -c ssher -l sort -f -a "recent name"
                 .replace(
                     ":name -- Server name to download files from:_default",
                     ":name -- Server name to download files from:_ssher_servers",
+                )
+                .replace(
+                    "::name -- Server name to ping:_default",
+                    "::name -- Server name to ping:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to ping:_default",
+                    ":name -- Server name to ping:_ssher_servers",
                 )
                 .replace(":JUMP:_default", ":JUMP:_ssher_servers")
                 .replace(
@@ -1683,7 +1743,7 @@ mod tests {
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
         assert!(bash.contains("--sort"));
-        assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id|put|get"));
+        assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id|put|get|ping"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
@@ -1696,12 +1756,13 @@ mod tests {
         assert!(zsh.contains(":name -- Server name to copy SSH key to:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to upload files to:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to download files from:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to ping:_ssher_servers"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
-        assert!(fish.contains("connect edit remove fav unfav exec copy-id put get"));
+        assert!(fish.contains("connect edit remove fav unfav exec copy-id put get ping"));
         assert!(fish.contains("-l jump"));
         assert!(fish.contains("-l sort"));
     }
@@ -2104,5 +2165,59 @@ mod tests {
         assert!(Cli::try_parse_from(["ssher", "get", "myserver"]).is_err());
         assert!(Cli::try_parse_from(["ssher", "get", "myserver", "only_one"]).is_err());
         assert!(Cli::try_parse_from(["ssher", "get"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_ping_defaults() {
+        let cli = Cli::try_parse_from(["ssher", "ping"]).unwrap();
+        match cli.command {
+            Commands::Ping { name, tag, timeout } => {
+                assert_eq!(name, None);
+                assert!(tag.is_empty());
+                assert_eq!(timeout, 3);
+            }
+            _ => panic!("expected Commands::Ping"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_ping_name() {
+        let cli = Cli::try_parse_from(["ssher", "ping", "myserver"]).unwrap();
+        match cli.command {
+            Commands::Ping { name, tag, timeout } => {
+                assert_eq!(name.as_deref(), Some("myserver"));
+                assert!(tag.is_empty());
+                assert_eq!(timeout, 3);
+            }
+            _ => panic!("expected Commands::Ping"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_ping_tags_and_timeout() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "ping",
+            "--tag",
+            "prod",
+            "--tag",
+            "web",
+            "--timeout",
+            "10",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ping { name, tag, timeout } => {
+                assert_eq!(name, None);
+                assert_eq!(tag, vec!["prod", "web"]);
+                assert_eq!(timeout, 10);
+            }
+            _ => panic!("expected Commands::Ping"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_ping_name_and_tag_conflict() {
+        assert!(Cli::try_parse_from(["ssher", "ping", "myserver", "--tag", "prod"]).is_err());
     }
 }

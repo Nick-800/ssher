@@ -1,6 +1,13 @@
 use crate::error::{Result, SshManagerError};
 use crate::storage::Storage;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::fmt;
+use std::io;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AuthMethod {
@@ -643,6 +650,244 @@ pub fn select_exec_targets<'a>(
     }
 
     Err(SshManagerError::NoServersMatch)
+}
+
+/// TCP reachability status of a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingStatus {
+    Ok(Duration),
+    Refused,
+    Timeout,
+    DnsError,
+}
+
+impl PingStatus {
+    pub fn is_up(&self) -> bool {
+        matches!(self, PingStatus::Ok(_))
+    }
+}
+
+impl fmt::Display for PingStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PingStatus::Ok(d) => write!(f, "OK {}ms", d.as_millis()),
+            PingStatus::Refused => write!(f, "refused"),
+            PingStatus::Timeout => write!(f, "timeout"),
+            PingStatus::DnsError => write!(f, "dns error"),
+        }
+    }
+}
+
+/// Result of a TCP health check for a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingResult {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub status: PingStatus,
+}
+
+impl PingResult {
+    pub fn is_up(&self) -> bool {
+        self.status.is_up()
+    }
+}
+
+/// Classify an `io::ErrorKind` into a `PingStatus`.
+pub fn classify_error_kind(kind: io::ErrorKind) -> PingStatus {
+    match kind {
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => PingStatus::Refused,
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => PingStatus::Timeout,
+        io::ErrorKind::NotFound => PingStatus::DnsError,
+        _ => PingStatus::Timeout,
+    }
+}
+
+/// Classify an `io::ErrorKind` into a `PingStatus` (alias).
+#[allow(dead_code)]
+pub fn classify_io_error(kind: io::ErrorKind) -> PingStatus {
+    classify_error_kind(kind)
+}
+
+/// Classify an `io::Error` into a `PingStatus`.
+#[allow(dead_code)]
+pub fn status_from_io_error(err: &io::Error) -> PingStatus {
+    classify_error_kind(err.kind())
+}
+
+/// Select servers for ping subcommand based on name or tags.
+///
+/// If both `name` and non-empty `tags` are provided, returns `InvalidConfig`.
+/// If `name` is provided, resolves the single server via `resolve_server`.
+/// If `tags` are provided, validates tags and returns all servers having all specified tags
+/// in list order (or `NoServersMatch` if none match).
+/// If neither is provided, returns all servers in list order (or `NoServersMatch` if empty).
+pub fn select_ping_targets<'a>(
+    servers: &'a [Server],
+    name: Option<&str>,
+    tags: &[String],
+) -> Result<Vec<&'a Server>> {
+    if name.is_some() && !tags.is_empty() {
+        return Err(SshManagerError::InvalidConfig(
+            "Cannot specify both server name and --tag".to_string(),
+        ));
+    }
+
+    if let Some(n) = name {
+        let server = resolve_server(servers, n)?;
+        return Ok(vec![server]);
+    }
+
+    if !tags.is_empty() {
+        for tag in tags {
+            Storage::validate_tag(tag)?;
+        }
+        let normalized: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+        let matches: Vec<&'a Server> = servers
+            .iter()
+            .filter(|server| {
+                normalized
+                    .iter()
+                    .all(|ft| server.tags.iter().any(|st| st == ft))
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return Err(SshManagerError::NoServersMatch);
+        }
+        return Ok(matches);
+    }
+
+    if servers.is_empty() {
+        return Err(SshManagerError::NoServersMatch);
+    }
+
+    Ok(servers.iter().collect())
+}
+
+/// Format a single ping result line: `name  host:port  OK 12ms | refused | timeout | dns error`.
+pub fn format_ping_result(name: &str, host: &str, port: u16, status: &PingStatus) -> String {
+    format!("{}  {}:{}  {}", name, host, port, status)
+}
+
+/// Format the ping summary line: `up N / down M`.
+pub fn format_ping_summary(up: usize, down: usize) -> String {
+    format!("up {} / down {}", up, down)
+}
+
+/// Check TCP reachability of a single host:port via `TcpStream::connect_timeout`.
+pub fn ping_server_tcp(host: &str, port: u16, timeout: Duration) -> PingStatus {
+    let clean_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let addrs = match (clean_host, port).to_socket_addrs() {
+        Ok(iter) => {
+            let list: Vec<SocketAddr> = iter.collect();
+            if list.is_empty() {
+                return PingStatus::DnsError;
+            }
+            list
+        }
+        Err(_) => return PingStatus::DnsError,
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut last_status = PingStatus::Timeout;
+
+    for addr in addrs {
+        let now = Instant::now();
+        if now >= deadline {
+            last_status = PingStatus::Timeout;
+            break;
+        }
+        let remaining = deadline - now;
+        let start = Instant::now();
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(_stream) => {
+                return PingStatus::Ok(start.elapsed());
+            }
+            Err(e) => {
+                last_status = classify_error_kind(e.kind());
+            }
+        }
+    }
+
+    last_status
+}
+
+/// Check servers concurrently with std::thread (concurrency capped at 16) and preserve list order.
+pub fn ping_servers(servers: &[&Server], timeout: Duration) -> Vec<PingResult> {
+    ping_servers_with_runner(servers, timeout, 16, ping_server_tcp)
+}
+
+/// Check servers concurrently with a custom runner function (concurrency capped at 16) and preserve list order.
+pub fn ping_servers_with_runner<F>(
+    servers: &[&Server],
+    timeout: Duration,
+    max_concurrency: usize,
+    runner: F,
+) -> Vec<PingResult>
+where
+    F: Fn(&str, u16, Duration) -> PingStatus + Sync + Send + Copy + 'static,
+{
+    if servers.is_empty() {
+        return Vec::new();
+    }
+
+    let concurrency = max_concurrency.clamp(1, 16).min(servers.len());
+    let queue = Arc::new(Mutex::new(
+        servers
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (i, s.name.clone(), s.host.clone(), s.port))
+            .collect::<VecDeque<_>>(),
+    ));
+
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for _ in 0..concurrency {
+        let q = Arc::clone(&queue);
+        let sender = tx.clone();
+        let handle = thread::spawn(move || loop {
+            let item = {
+                let mut locked = q.lock().unwrap();
+                locked.pop_front()
+            };
+            match item {
+                Some((idx, name, host, port)) => {
+                    let status = runner(&host, port, timeout);
+                    let result = PingResult {
+                        name,
+                        host,
+                        port,
+                        status,
+                    };
+                    if sender.send((idx, result)).is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        });
+        handles.push(handle);
+    }
+    drop(tx);
+
+    let mut indexed_results: Vec<Option<PingResult>> = (0..servers.len()).map(|_| None).collect();
+    for (idx, res) in rx {
+        if idx < indexed_results.len() {
+            indexed_results[idx] = Some(res);
+        }
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    indexed_results.into_iter().flatten().collect()
 }
 
 /// Pure comparator ordering favourites first, then most-recently-used first, then name.
@@ -2999,5 +3244,230 @@ Match host other
             }
             _ => panic!("expected LocalSourceNotFound"),
         }
+    }
+
+    #[test]
+    fn format_ping_result_formatting() {
+        assert_eq!(
+            format_ping_result(
+                "myserver",
+                "example.com",
+                22,
+                &PingStatus::Ok(Duration::from_millis(12))
+            ),
+            "myserver  example.com:22  OK 12ms"
+        );
+        assert_eq!(
+            format_ping_result("srv1", "10.0.0.1", 2222, &PingStatus::Refused),
+            "srv1  10.0.0.1:2222  refused"
+        );
+        assert_eq!(
+            format_ping_result("srv2", "10.0.0.2", 22, &PingStatus::Timeout),
+            "srv2  10.0.0.2:22  timeout"
+        );
+        assert_eq!(
+            format_ping_result("srv3", "bad.host", 22, &PingStatus::DnsError),
+            "srv3  bad.host:22  dns error"
+        );
+    }
+
+    #[test]
+    fn format_ping_summary_formatting() {
+        assert_eq!(format_ping_summary(3, 1), "up 3 / down 1");
+        assert_eq!(format_ping_summary(0, 2), "up 0 / down 2");
+        assert_eq!(format_ping_summary(5, 0), "up 5 / down 0");
+    }
+
+    #[test]
+    fn ping_status_display_and_is_up() {
+        let ok = PingStatus::Ok(Duration::from_millis(42));
+        assert!(ok.is_up());
+        assert_eq!(ok.to_string(), "OK 42ms");
+
+        let refused = PingStatus::Refused;
+        assert!(!refused.is_up());
+        assert_eq!(refused.to_string(), "refused");
+
+        let timeout = PingStatus::Timeout;
+        assert!(!timeout.is_up());
+        assert_eq!(timeout.to_string(), "timeout");
+
+        let dns = PingStatus::DnsError;
+        assert!(!dns.is_up());
+        assert_eq!(dns.to_string(), "dns error");
+    }
+
+    #[test]
+    fn status_classification_from_error_kind() {
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::ConnectionRefused),
+            PingStatus::Refused
+        );
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::ConnectionReset),
+            PingStatus::Refused
+        );
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::TimedOut),
+            PingStatus::Timeout
+        );
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::WouldBlock),
+            PingStatus::Timeout
+        );
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::NotFound),
+            PingStatus::DnsError
+        );
+        assert_eq!(
+            classify_error_kind(io::ErrorKind::Other),
+            PingStatus::Timeout
+        );
+        assert_eq!(
+            classify_io_error(io::ErrorKind::ConnectionRefused),
+            PingStatus::Refused
+        );
+        let io_err = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        assert_eq!(status_from_io_error(&io_err), PingStatus::Timeout);
+    }
+
+    #[test]
+    fn select_ping_targets_by_name() {
+        let servers = vec![sample_server("web-prod"), sample_server("db-prod")];
+        let targets = select_ping_targets(&servers, Some("web-prod"), &[]).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "web-prod");
+
+        let targets = select_ping_targets(&servers, Some("db"), &[]).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "db-prod");
+    }
+
+    #[test]
+    fn select_ping_targets_by_tag() {
+        let mut s1 = sample_server("s1");
+        s1.tags = vec!["prod".to_string(), "web".to_string()];
+        let mut s2 = sample_server("s2");
+        s2.tags = vec!["prod".to_string(), "db".to_string()];
+        let mut s3 = sample_server("s3");
+        s3.tags = vec!["staging".to_string()];
+
+        let servers = vec![s1, s2, s3];
+
+        let targets = select_ping_targets(&servers, None, &[String::from("prod")]).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "s1");
+        assert_eq!(targets[1].name, "s2");
+
+        let targets =
+            select_ping_targets(&servers, None, &[String::from("prod"), String::from("web")])
+                .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "s1");
+    }
+
+    #[test]
+    fn select_ping_targets_all_servers_in_list_order() {
+        let servers = vec![
+            sample_server("srv-c"),
+            sample_server("srv-a"),
+            sample_server("srv-b"),
+        ];
+        let targets = select_ping_targets(&servers, None, &[]).unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].name, "srv-c");
+        assert_eq!(targets[1].name, "srv-a");
+        assert_eq!(targets[2].name, "srv-b");
+    }
+
+    #[test]
+    fn select_ping_targets_errors() {
+        let servers = vec![sample_server("srv1")];
+
+        let err = select_ping_targets(&servers, Some("srv1"), &[String::from("prod")]).unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidConfig(_)));
+
+        let empty: Vec<Server> = Vec::new();
+        let err = select_ping_targets(&empty, None, &[]).unwrap_err();
+        assert!(matches!(err, SshManagerError::NoServersMatch));
+
+        let err = select_ping_targets(&servers, None, &[String::from("nonexistent")]).unwrap_err();
+        assert!(matches!(err, SshManagerError::NoServersMatch));
+
+        let err = select_ping_targets(&servers, None, &[String::from("bad tag!")]).unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidTag(_)));
+
+        let err = select_ping_targets(&servers, Some("missing"), &[]).unwrap_err();
+        assert!(matches!(err, SshManagerError::ServerNotFound(_)));
+    }
+
+    #[test]
+    fn ping_servers_ordering_preserved_concurrently() {
+        let mut s0 = sample_server("srv-0");
+        s0.port = 20;
+        let mut s1 = sample_server("srv-1");
+        s1.port = 21;
+        let mut s2 = sample_server("srv-2");
+        s2.port = 22;
+        let mut s3 = sample_server("srv-3");
+        s3.port = 23;
+        let mut s4 = sample_server("srv-4");
+        s4.port = 24;
+        let test_servers = vec![&s0, &s1, &s2, &s3, &s4];
+
+        let mock_runner = |_host: &str, port: u16, _timeout: Duration| -> PingStatus {
+            let delay_ms = match port {
+                20 => 40,
+                21 => 25,
+                22 => 15,
+                23 => 5,
+                _ => 1,
+            };
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            PingStatus::Ok(Duration::from_millis(delay_ms))
+        };
+
+        let results =
+            ping_servers_with_runner(&test_servers, Duration::from_secs(1), 16, mock_runner);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].name, "srv-0");
+        assert_eq!(results[1].name, "srv-1");
+        assert_eq!(results[2].name, "srv-2");
+        assert_eq!(results[3].name, "srv-3");
+        assert_eq!(results[4].name, "srv-4");
+    }
+
+    #[test]
+    fn ping_server_tcp_loopback_listener_ok() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let status = ping_server_tcp("127.0.0.1", port, Duration::from_secs(1));
+        assert!(matches!(status, PingStatus::Ok(_)));
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn ping_server_tcp_loopback_closed_port_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let status = ping_server_tcp("127.0.0.1", port, Duration::from_millis(500));
+        assert_eq!(status, PingStatus::Refused);
+    }
+
+    #[test]
+    fn ping_server_tcp_dns_error() {
+        let status = ping_server_tcp(
+            "invalid.invalid.doesnotexist.test",
+            22,
+            Duration::from_millis(200),
+        );
+        assert_eq!(status, PingStatus::DnsError);
     }
 }
