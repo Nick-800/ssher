@@ -9,6 +9,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Jump Host / ProxyJump**: Support for bastion/jump hosts via saved server references or raw SSH jump specs, with chain resolution and cycle detection
 - **Port Forwarding Presets**: Local (-L), Remote (-R), and Dynamic (-D) port forwarding presets and ad-hoc connection forwards with port shorthand support
 - **Tags & Filtering**: Organize servers with tags, filter by tag sets, and search tags in the browser
+- **Favourites & Recency Tracking**: Mark servers as favourites, track last used connection timestamps, and sort by recent usage or alphabetically
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
 - **SSH Options**: Support for custom ports, SSH agent forwarding, identity files, and jump hosts
@@ -92,9 +93,14 @@ ssher add web-server 10.0.0.7 admin --key /path/to/key \
 
 ### List All Servers
 
-List all configured servers:
+List all configured servers (defaults to `--sort recent` with favourites first, then most recently used):
 ```bash
 ssher list
+```
+
+Sort alphabetically by server name:
+```bash
+ssher list --sort name
 ```
 
 Filter servers by tag (repeatable; matches servers having all specified tags):
@@ -104,12 +110,27 @@ ssher list --tag prod --tag web
 
 Output:
 ```
-Name                 Host                 Username        Port       Auth         Agent FW   Via              Fwd      Tags
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-myserver             example.com          username        22         key          no         -                1        prod, web
-internal-node        10.0.0.5             admin           22         key          no         bastion          -        -
-prod-server          prod.example.com     root            22         password     yes        -                -        -
+Name                 Host                 Username        Port       Auth         Agent FW   Via              Fwd      Fav   Last used    Tags
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myserver             example.com          username        22         key          no         -                1        *     3h ago       prod, web
+internal-node        10.0.0.5             admin           22         key          no         bastion          -        -     never        -
+prod-server          prod.example.com     root            22         password     yes        -                -        -     never        -
 ```
+
+### Favorite and Unfavorite Servers
+
+Mark a server as a favorite:
+```bash
+ssher fav myserver
+```
+
+Remove a server from favorites:
+```bash
+ssher unfav myserver
+```
+
+Favorite servers are marked with `*` in the `Fav` column and sorted to the top when using default or `--sort recent` ordering.
+You can also toggle favorite status in the interactive TUI server browser with the `f` key.
 
 ### Connect to a Server
 
@@ -219,7 +240,7 @@ ssher
 
 Select **Browse Servers** to open the in-terminal server browser.
 
-The browser displays jump hosts, port forward presets count, and tags in dedicated `VIA`, `FWD`, and `TAGS` columns for quick visibility.
+The browser displays jump hosts, port forward presets count, favorite status, last used timestamp, and tags in dedicated `VIA`, `FWD`, `FAV`, `LAST USED`, and `TAGS` columns for quick visibility.
 
 #### Browser Keybindings:
 - `j` / `k` or `↓` / `↑`: Move selection up/down
@@ -227,6 +248,7 @@ The browser displays jump hosts, port forward presets count, and tags in dedicat
 - `a`: Add a new server (prompts include comma-separated tags, optional jump host, and comma-separated port forwards)
 - `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host or port forwards)
 - `d`: Delete selected server (with y/n confirmation; blocked if referenced as a jump host)
+- `f`: Toggle favorite status for selected server (re-sorts favourites to top and keeps selection pointed at the server)
 - `/`: Filter servers by name, host, tags, jump host, or port forwards (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
@@ -336,7 +358,7 @@ _ssher_complete() {
     local subcmd=""
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove)
+            connect|edit|remove|fav|unfav)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -381,9 +403,10 @@ _ssher_tags() {
 
 **Fish snippet:**
 ```fish
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
+complete -c ssher -l sort -f -a "recent name"
 ```
 
 ## Configuration Files
@@ -491,6 +514,11 @@ ssher edit <name> [OPTIONS]
 # List servers
 ssher list [OPTIONS]
   --tag <tag>                  Filter by tag (repeatable, must match all)
+  --sort <recent|name>         Sort order (default: recent, favourites first then recently used; name: plain alphabetical)
+
+# Favorite / Unfavorite a server
+ssher fav <name>
+ssher unfav <name>
 
 # Connect to a server (exact name or unambiguous partial match)
 ssher connect <name> [OPTIONS]

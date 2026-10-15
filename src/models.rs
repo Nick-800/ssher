@@ -187,6 +187,10 @@ impl<'de> Deserialize<'de> for Forward {
     }
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Server {
     pub name: String,
@@ -204,6 +208,10 @@ pub struct Server {
     pub jump_host: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub favorite: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +264,8 @@ impl Server {
             tags: Vec::new(),
             jump_host: None,
             forwards: Vec::new(),
+            favorite: false,
+            last_used: None,
         }
     }
 }
@@ -586,6 +596,101 @@ pub fn format_tag_completions(servers: &[Server]) -> String {
         output.push('\n');
     }
     output
+}
+
+/// Pure comparator ordering favourites first, then most-recently-used first, then name.
+pub fn sort_servers(a: &Server, b: &Server) -> std::cmp::Ordering {
+    b.favorite
+        .cmp(&a.favorite)
+        .then_with(|| b.last_used.cmp(&a.last_used))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// Format a relative timestamp (e.g. "never", "just now", "3h ago", "2d ago") given `now` in epoch seconds.
+pub fn format_last_used(last_used: Option<u64>, now: u64) -> String {
+    let ts = match last_used {
+        Some(ts) => ts,
+        None => return "never".to_string(),
+    };
+
+    if ts > now {
+        return "just now".to_string();
+    }
+
+    let diff = now - ts;
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
+
+/// Get current Unix epoch timestamp in seconds.
+pub fn current_time_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Stamp `last_used` on a server using a provided time function.
+pub fn stamp_server_last_used<F>(server: &mut Server, now_fn: F)
+where
+    F: FnOnce() -> u64,
+{
+    server.last_used = Some(now_fn());
+}
+
+/// Stamp `last_used` on a server by name in a slice of servers using a provided time function.
+/// Returns true if the server was found and updated, false otherwise.
+pub fn stamp_server_in_slice<F>(servers: &mut [Server], server_name: &str, now_fn: F) -> bool
+where
+    F: FnOnce() -> u64,
+{
+    if let Some(s) = servers.iter_mut().find(|s| s.name == server_name) {
+        stamp_server_last_used(s, now_fn);
+        true
+    } else {
+        false
+    }
+}
+
+/// Find the index in `filtered_indices` corresponding to `server_name` in `servers`.
+/// Useful for maintaining browser selection after reordering.
+pub fn find_selected_index(
+    servers: &[Server],
+    filtered_indices: &[usize],
+    server_name: &str,
+) -> Option<usize> {
+    filtered_indices
+        .iter()
+        .position(|&idx| servers.get(idx).map(|s| s.name.as_str()) == Some(server_name))
+}
+
+/// Set a server's favorite status by name in a slice of servers.
+/// Returns true if the server was found and updated, false otherwise.
+pub fn set_server_favorite(servers: &mut [Server], name: &str, favorite: bool) -> bool {
+    if let Some(s) = servers.iter_mut().find(|s| s.name == name) {
+        s.favorite = favorite;
+        true
+    } else {
+        false
+    }
+}
+
+/// Toggle a server's favorite status by name in a slice of servers.
+/// Returns Some(new_favorite_state) if found, or None if not found.
+pub fn toggle_server_favorite(servers: &mut [Server], name: &str) -> Option<bool> {
+    if let Some(s) = servers.iter_mut().find(|s| s.name == name) {
+        s.favorite = !s.favorite;
+        Some(s.favorite)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2210,5 +2315,202 @@ Match host other
         assert!(server_matches_query(&s, "5432"));
         assert!(server_matches_query(&s, "localhost"));
         assert!(!server_matches_query(&s, "9999"));
+    }
+
+    #[test]
+    fn server_parses_from_json_without_favorite_and_last_used_backward_compat() {
+        let json = r#"{
+            "name": "srv",
+            "host": "1.2.3.4",
+            "username": "alice",
+            "port": 22,
+            "auth_method": "key"
+        }"#;
+        let s: Server = serde_json::from_str(json).unwrap();
+        assert!(!s.favorite);
+        assert_eq!(s.last_used, None);
+    }
+
+    #[test]
+    fn server_favorite_and_last_used_omitted_when_default() {
+        let s = sample_server("srv");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("favorite"));
+        assert!(!json.contains("last_used"));
+    }
+
+    #[test]
+    fn server_round_trips_through_json_with_favorite_and_last_used() {
+        let mut s = sample_server("srv");
+        s.favorite = true;
+        s.last_used = Some(1700000000);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"favorite\":true"));
+        assert!(json.contains("\"last_used\":1700000000"));
+
+        let deserialized: Server = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.favorite);
+        assert_eq!(deserialized.last_used, Some(1700000000));
+    }
+
+    #[test]
+    fn sort_servers_favorites_first_then_mru_then_name() {
+        let mut s_fav_old = sample_server("b_fav_old");
+        s_fav_old.favorite = true;
+        s_fav_old.last_used = Some(100);
+
+        let mut s_fav_recent = sample_server("a_fav_recent");
+        s_fav_recent.favorite = true;
+        s_fav_recent.last_used = Some(200);
+
+        let mut s_fav_never = sample_server("c_fav_never");
+        s_fav_never.favorite = true;
+        s_fav_never.last_used = None;
+
+        let mut s_nonfav_recent = sample_server("z_nonfav_recent");
+        s_nonfav_recent.favorite = false;
+        s_nonfav_recent.last_used = Some(500);
+
+        let mut s_nonfav_old = sample_server("y_nonfav_old");
+        s_nonfav_old.favorite = false;
+        s_nonfav_old.last_used = Some(50);
+
+        let s_nonfav_never_b = sample_server("b_nonfav_never");
+        let s_nonfav_never_a = sample_server("a_nonfav_never");
+
+        let mut servers = [
+            s_nonfav_never_b,
+            s_nonfav_old,
+            s_fav_never,
+            s_nonfav_never_a,
+            s_fav_old,
+            s_nonfav_recent,
+            s_fav_recent,
+        ];
+
+        servers.sort_by(sort_servers);
+
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "a_fav_recent",    // fav, last_used: 200
+                "b_fav_old",       // fav, last_used: 100
+                "c_fav_never",     // fav, last_used: None
+                "z_nonfav_recent", // non-fav, last_used: 500
+                "y_nonfav_old",    // non-fav, last_used: 50
+                "a_nonfav_never",  // non-fav, last_used: None, name tiebreak 'a'
+                "b_nonfav_never",  // non-fav, last_used: None, name tiebreak 'b'
+            ]
+        );
+    }
+
+    #[test]
+    fn format_last_used_relative_formatting() {
+        let now = 100_000_000;
+
+        assert_eq!(format_last_used(None, now), "never");
+        assert_eq!(format_last_used(Some(now), now), "just now");
+        assert_eq!(format_last_used(Some(now - 10), now), "just now");
+        assert_eq!(format_last_used(Some(now - 59), now), "just now");
+        assert_eq!(format_last_used(Some(now - 60), now), "1m ago");
+        assert_eq!(format_last_used(Some(now - 120), now), "2m ago");
+        assert_eq!(format_last_used(Some(now - 3599), now), "59m ago");
+        assert_eq!(format_last_used(Some(now - 3600), now), "1h ago");
+        assert_eq!(format_last_used(Some(now - 3 * 3600), now), "3h ago");
+        assert_eq!(format_last_used(Some(now - 86399), now), "23h ago");
+        assert_eq!(format_last_used(Some(now - 86400), now), "1d ago");
+        assert_eq!(format_last_used(Some(now - 2 * 86400), now), "2d ago");
+        assert_eq!(format_last_used(Some(now - 30 * 86400), now), "30d ago");
+        // Future timestamp (clock skew)
+        assert_eq!(format_last_used(Some(now + 100), now), "just now");
+    }
+
+    #[test]
+    fn stamp_server_and_slice_pure_logic() {
+        let mut s = sample_server("alpha");
+        assert_eq!(s.last_used, None);
+
+        stamp_server_last_used(&mut s, || 123456);
+        assert_eq!(s.last_used, Some(123456));
+
+        let mut servers = vec![sample_server("alpha"), sample_server("beta")];
+        let found = stamp_server_in_slice(&mut servers, "beta", || 987654);
+        assert!(found);
+        assert_eq!(servers[1].last_used, Some(987654));
+        assert_eq!(servers[0].last_used, None);
+
+        let not_found = stamp_server_in_slice(&mut servers, "gamma", || 1111);
+        assert!(!not_found);
+    }
+
+    #[test]
+    fn edit_apply_preserves_favorite_and_last_used() {
+        let mut s = sample_server("srv");
+        s.favorite = true;
+        s.last_used = Some(424242);
+
+        let cfg = Config::new();
+        let edit = ServerEdit {
+            host: Some("updated.example.com".to_string()),
+            port: Some(2222),
+            ..Default::default()
+        };
+
+        edit.apply(&mut s, &cfg).unwrap();
+        assert_eq!(s.host, "updated.example.com");
+        assert_eq!(s.port, 2222);
+        assert!(s.favorite, "favorite must be preserved untouched");
+        assert_eq!(
+            s.last_used,
+            Some(424242),
+            "last_used must be preserved untouched"
+        );
+    }
+
+    #[test]
+    fn find_selected_index_maintains_position() {
+        let s1 = sample_server("alpha");
+        let s2 = sample_server("beta");
+        let s3 = sample_server("gamma");
+        let servers = vec![s1, s2, s3];
+
+        let filtered_indices = vec![0, 1, 2];
+        assert_eq!(
+            find_selected_index(&servers, &filtered_indices, "beta"),
+            Some(1)
+        );
+
+        // After reorder, beta is at index 0
+        let reordered = vec![sample_server("beta"), sample_server("alpha")];
+        let reordered_filtered = vec![0, 1];
+        assert_eq!(
+            find_selected_index(&reordered, &reordered_filtered, "beta"),
+            Some(0)
+        );
+        assert_eq!(
+            find_selected_index(&reordered, &reordered_filtered, "missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn set_and_toggle_server_favorite_pure() {
+        let mut servers = vec![sample_server("srv1"), sample_server("srv2")];
+
+        assert!(!servers[0].favorite);
+        assert!(set_server_favorite(&mut servers, "srv1", true));
+        assert!(servers[0].favorite);
+
+        let toggled = toggle_server_favorite(&mut servers, "srv1");
+        assert_eq!(toggled, Some(false));
+        assert!(!servers[0].favorite);
+
+        let toggled2 = toggle_server_favorite(&mut servers, "srv1");
+        assert_eq!(toggled2, Some(true));
+        assert!(servers[0].favorite);
+
+        assert_eq!(toggle_server_favorite(&mut servers, "nonexistent"), None);
+        assert!(!set_server_favorite(&mut servers, "nonexistent", true));
     }
 }

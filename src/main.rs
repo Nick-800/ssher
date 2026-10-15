@@ -22,6 +22,13 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum ListSort {
+    #[default]
+    Recent,
+    Name,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Add a new SSH server
@@ -105,6 +112,9 @@ enum Commands {
         /// Filter servers by tag (repeatable, must have all tags)
         #[arg(long = "tag", action = clap::ArgAction::Append)]
         tag: Vec<String>,
+        /// Sort order for listed servers (recent: favourites first, then most recently used; name: alphabetical)
+        #[arg(long = "sort", default_value = "recent")]
+        sort: ListSort,
     },
 
     /// Connect to a saved SSH server
@@ -125,6 +135,18 @@ enum Commands {
     /// Remove a saved SSH server
     Remove {
         /// Server name to remove
+        name: String,
+    },
+
+    /// Mark a saved SSH server as favorite
+    Fav {
+        /// Server name to favorite
+        name: String,
+    },
+
+    /// Remove a saved SSH server from favorites
+    Unfav {
+        /// Server name to unfavorite
         name: String,
     },
 
@@ -263,7 +285,7 @@ fn run(cli: Cli) -> Result<()> {
                 },
             )
         }
-        Commands::List { tag } => list_servers(&tag),
+        Commands::List { tag, sort } => list_servers(&tag, sort),
         Commands::Connect {
             name,
             current,
@@ -271,6 +293,8 @@ fn run(cli: Cli) -> Result<()> {
             no_forwards,
         } => connect_server(&name, current, &forward, no_forwards),
         Commands::Remove { name } => remove_server(&name),
+        Commands::Fav { name } => set_favorite(&name, true),
+        Commands::Unfav { name } => set_favorite(&name, false),
         Commands::Import {
             file,
             dry_run,
@@ -376,7 +400,7 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_servers(filter_tags: &[String]) -> Result<()> {
+fn list_servers(filter_tags: &[String], sort_order: ListSort) -> Result<()> {
     let config = Storage::load_config()?;
 
     if config.servers.is_empty() {
@@ -390,7 +414,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
 
     let normalized_filters: Vec<String> = filter_tags.iter().map(|t| t.to_lowercase()).collect();
 
-    let matching_servers: Vec<&Server> = config
+    let mut matching_servers: Vec<&Server> = config
         .servers
         .iter()
         .filter(|server| {
@@ -405,11 +429,28 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    match sort_order {
+        ListSort::Recent => matching_servers.sort_by(|a, b| models::sort_servers(a, b)),
+        ListSort::Name => matching_servers.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+
+    let now = models::current_time_epoch_secs();
+
     println!(
-        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
-        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Fwd", "Tags"
+        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<5} {:<12} {:<20}",
+        "Name",
+        "Host",
+        "Username",
+        "Port",
+        "Auth",
+        "Agent FW",
+        "Via",
+        "Fwd",
+        "Fav",
+        "Last used",
+        "Tags"
     );
-    println!("{}", "─".repeat(131));
+    println!("{}", "─".repeat(150));
 
     for server in matching_servers {
         let auth = match server.auth_method {
@@ -423,6 +464,8 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         };
         let via_str = server.jump_host.as_deref().unwrap_or("-");
         let fwd_str = models::format_forwards_summary(&server.forwards);
+        let fav_str = if server.favorite { "*" } else { "-" };
+        let last_used_str = models::format_last_used(server.last_used, now);
         let tags_str = if server.tags.is_empty() {
             "-".to_string()
         } else {
@@ -430,7 +473,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         };
 
         println!(
-            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<5} {:<12} {:<20}",
             server.name,
             server.host,
             server.username,
@@ -439,10 +482,29 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
             agent_fw,
             via_str,
             fwd_str,
+            fav_str,
+            last_used_str,
             tags_str
         );
     }
 
+    Ok(())
+}
+
+fn set_favorite(name: &str, favorite: bool) -> Result<()> {
+    let mut config = Storage::load_config()?;
+    let server = config.resolve_server(name)?;
+    let server_name = server.name.clone();
+
+    if models::set_server_favorite(&mut config.servers, &server_name, favorite) {
+        Storage::save_config(&config)?;
+    }
+
+    if favorite {
+        println!("Server '{}' marked as favorite!", server_name);
+    } else {
+        println!("Server '{}' removed from favorites!", server_name);
+    }
     Ok(())
 }
 
@@ -549,7 +611,11 @@ fn connect_server(
     };
 
     println!("Connecting to {}...", server.name);
+    let server_name = server.name.clone();
     Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &effective_forwards)?;
+    if let Err(e) = Storage::record_server_launch(&server_name) {
+        eprintln!("Warning: failed to save last used timestamp: {}", e);
+    }
 
     Ok(())
 }
@@ -730,6 +796,10 @@ _ssher_complete() {
             _ssher "$@"
             return 0
             ;;
+        --sort)
+            COMPREPLY=( $(compgen -W "recent name" -- "${cur}") )
+            return 0
+            ;;
         --jump)
             local servers
             servers="$(ssher __complete-servers 2>/dev/null)"
@@ -751,7 +821,7 @@ _ssher_complete() {
     local subcmd=""
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove)
+            connect|edit|remove|fav|unfav)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -783,10 +853,11 @@ fi
         }
         clap_complete::Shell::Fish => {
             let fish_snippet = r#"
-# Dynamic server completion for connect, edit, remove
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove" -f -a "(ssher __complete-servers)"
+# Dynamic server completion for connect, edit, remove, fav, unfav
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
+complete -c ssher -l sort -f -a "recent name"
 "#;
             format!("{raw}{fish_snippet}")
         }
@@ -803,6 +874,14 @@ complete -c ssher -l jump -f -a "(ssher __complete-servers)"
                 .replace(
                     ":name -- Server name to remove:_default",
                     ":name -- Server name to remove:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to favorite:_default",
+                    ":name -- Server name to favorite:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to unfavorite:_default",
+                    ":name -- Server name to unfavorite:_ssher_servers",
                 )
                 .replace(":JUMP:_default", ":JUMP:_ssher_servers");
             let zsh_snippet = r#"
@@ -988,10 +1067,47 @@ mod tests {
     fn cli_parse_list_tags() {
         let cli = Cli::try_parse_from(["ssher", "list", "--tag", "web", "--tag", "prod"]).unwrap();
         match cli.command {
-            Commands::List { tag } => {
+            Commands::List { tag, sort } => {
                 assert_eq!(tag, vec!["web".to_string(), "prod".to_string()]);
+                assert_eq!(sort, ListSort::Recent);
             }
             _ => panic!("expected Commands::List"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_list_sort() {
+        let cli = Cli::try_parse_from(["ssher", "list", "--sort", "name"]).unwrap();
+        match cli.command {
+            Commands::List { sort, .. } => {
+                assert_eq!(sort, ListSort::Name);
+            }
+            _ => panic!("expected Commands::List"),
+        }
+
+        let cli_recent = Cli::try_parse_from(["ssher", "list", "--sort", "recent"]).unwrap();
+        match cli_recent.command {
+            Commands::List { sort, .. } => {
+                assert_eq!(sort, ListSort::Recent);
+            }
+            _ => panic!("expected Commands::List"),
+        }
+
+        assert!(Cli::try_parse_from(["ssher", "list", "--sort", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_fav_and_unfav() {
+        let cli_fav = Cli::try_parse_from(["ssher", "fav", "myserver"]).unwrap();
+        match cli_fav.command {
+            Commands::Fav { name } => assert_eq!(name, "myserver"),
+            _ => panic!("expected Commands::Fav"),
+        }
+
+        let cli_unfav = Cli::try_parse_from(["ssher", "unfav", "myserver"]).unwrap();
+        match cli_unfav.command {
+            Commands::Unfav { name } => assert_eq!(name, "myserver"),
+            _ => panic!("expected Commands::Unfav"),
         }
     }
 
@@ -1251,6 +1367,8 @@ mod tests {
         assert!(bash.contains("_ssher_complete"));
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
+        assert!(bash.contains("--sort"));
+        assert!(bash.contains("connect|edit|remove|fav|unfav"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
@@ -1258,12 +1376,16 @@ mod tests {
         assert!(zsh.contains("_ssher_servers"));
         assert!(zsh.contains("_ssher_tags"));
         assert!(zsh.contains(":JUMP:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to favorite:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to unfavorite:_ssher_servers"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
+        assert!(fish.contains("connect edit remove fav unfav"));
         assert!(fish.contains("-l jump"));
+        assert!(fish.contains("-l sort"));
     }
 
     #[test]

@@ -307,6 +307,9 @@ impl Tui {
 
         println!("\nConnecting to {}...", server.name);
         Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
+        if let Err(e) = Storage::record_server_launch(&server.name) {
+            eprintln!("Warning: failed to save last used timestamp: {}", e);
+        }
         Ok(())
     }
 
@@ -558,6 +561,7 @@ impl Tui {
         terminal: &mut RattuiTerminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
         let mut config = Storage::load_config()?;
+        config.servers.sort_by(crate::models::sort_servers);
         let mut selected_index: usize = 0;
         let mut filter_query = String::new();
         let mut mode = BrowserMode::Normal;
@@ -591,6 +595,9 @@ impl Tui {
                                 needs_browser_redraw = true;
                             }
                             KeyCode::Enter if !filtered_indices.is_empty() => {
+                                let server_name = config.servers[filtered_indices[selected_index]]
+                                    .name
+                                    .clone();
                                 let server =
                                     config.servers[filtered_indices[selected_index]].clone();
                                 let cfg_clone = config.clone();
@@ -598,20 +605,48 @@ impl Tui {
                                     Self::connect_to_server(&server, &cfg_clone)
                                 })?;
                                 config = Storage::load_config()?;
+                                config.servers.sort_by(crate::models::sort_servers);
+                                let new_filtered = crate::models::filter_server_indices(
+                                    &config.servers,
+                                    &filter_query,
+                                );
+                                if let Some(new_idx) = crate::models::find_selected_index(
+                                    &config.servers,
+                                    &new_filtered,
+                                    &server_name,
+                                ) {
+                                    selected_index = new_idx;
+                                }
                                 needs_browser_redraw = true;
                             }
                             KeyCode::Char('a') => {
                                 Self::run_in_plain_screen(terminal, Self::show_add)?;
                                 config = Storage::load_config()?;
+                                config.servers.sort_by(crate::models::sort_servers);
                                 needs_browser_redraw = true;
                             }
                             KeyCode::Char('e') if !filtered_indices.is_empty() => {
+                                let server_name = config.servers[filtered_indices[selected_index]]
+                                    .name
+                                    .clone();
                                 let server =
                                     config.servers[filtered_indices[selected_index]].clone();
                                 Self::run_in_plain_screen(terminal, || {
                                     Self::prompt_edit_server(&server)
                                 })?;
                                 config = Storage::load_config()?;
+                                config.servers.sort_by(crate::models::sort_servers);
+                                let new_filtered = crate::models::filter_server_indices(
+                                    &config.servers,
+                                    &filter_query,
+                                );
+                                if let Some(new_idx) = crate::models::find_selected_index(
+                                    &config.servers,
+                                    &new_filtered,
+                                    &server_name,
+                                ) {
+                                    selected_index = new_idx;
+                                }
                                 needs_browser_redraw = true;
                             }
                             KeyCode::Char('d') if !filtered_indices.is_empty() => {
@@ -622,6 +657,35 @@ impl Tui {
                                     Self::prompt_delete_server(&server_name)
                                 })?;
                                 config = Storage::load_config()?;
+                                config.servers.sort_by(crate::models::sort_servers);
+                                needs_browser_redraw = true;
+                            }
+                            KeyCode::Char('f') if !filtered_indices.is_empty() => {
+                                let server_name = config.servers[filtered_indices[selected_index]]
+                                    .name
+                                    .clone();
+                                if crate::models::toggle_server_favorite(
+                                    &mut config.servers,
+                                    &server_name,
+                                )
+                                .is_some()
+                                {
+                                    if let Err(e) = Storage::save_config(&config) {
+                                        eprintln!("Warning: failed to save favorite status: {}", e);
+                                    }
+                                }
+                                config.servers.sort_by(crate::models::sort_servers);
+                                let new_filtered = crate::models::filter_server_indices(
+                                    &config.servers,
+                                    &filter_query,
+                                );
+                                if let Some(new_idx) = crate::models::find_selected_index(
+                                    &config.servers,
+                                    &new_filtered,
+                                    &server_name,
+                                ) {
+                                    selected_index = new_idx;
+                                }
                                 needs_browser_redraw = true;
                             }
                             KeyCode::Char('/') => {
@@ -747,10 +811,20 @@ impl Tui {
             f.render_widget(no_match_msg, chunks[1]);
         } else {
             let col_header = format!(
-                "  {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
-                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "VIA", "FWD", "TAGS"
+                "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
+                "NAME",
+                "HOST",
+                "USER",
+                "PORT",
+                "AUTH",
+                "AGENT FW",
+                "VIA",
+                "FWD",
+                "FAV",
+                "LAST USED",
+                "TAGS"
             );
-            let separator = format!("  {}", "─".repeat(110));
+            let separator = format!("  {}", "─".repeat(116));
 
             let mut items = Vec::new();
             items.push(
@@ -771,6 +845,9 @@ impl Tui {
                 let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
                 let via_str = s.jump_host.as_deref().unwrap_or("-");
                 let fwd_str = crate::models::format_forwards_summary(&s.forwards);
+                let fav_str = if s.favorite { "*" } else { "-" };
+                let now = crate::models::current_time_epoch_secs();
+                let last_used_str = crate::models::format_last_used(s.last_used, now);
                 let tags_str = if s.tags.is_empty() {
                     "-".to_string()
                 } else {
@@ -779,7 +856,7 @@ impl Tui {
 
                 if view_idx == selected_index {
                     let line = format!(
-                        "▶ {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
+                        "▶ {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
                         s.name,
                         s.host,
                         s.username,
@@ -788,6 +865,8 @@ impl Tui {
                         af_str,
                         via_str,
                         fwd_str,
+                        fav_str,
+                        last_used_str,
                         tags_str
                     );
                     items.push(
@@ -799,7 +878,7 @@ impl Tui {
                     );
                 } else {
                     let line = format!(
-                        "  {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
+                        "  {:<18} {:<18} {:<12} {:<6} {:<8} {:<9} {:<12} {:<5} {:<5} {:<11} {}",
                         s.name,
                         s.host,
                         s.username,
@@ -808,6 +887,8 @@ impl Tui {
                         af_str,
                         via_str,
                         fwd_str,
+                        fav_str,
+                        last_used_str,
                         tags_str
                     );
                     items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
@@ -873,6 +954,13 @@ impl Tui {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" Delete • "),
+                    Span::styled(
+                        "f",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Fav • "),
                     Span::styled(
                         "/",
                         Style::default()
@@ -1163,6 +1251,9 @@ impl Tui {
 
         println!("\nConnecting to {}...", server.name);
         Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
+        if let Err(e) = Storage::record_server_launch(&server.name) {
+            eprintln!("Warning: failed to save last used timestamp: {}", e);
+        }
 
         Ok(())
     }

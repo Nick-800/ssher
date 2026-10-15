@@ -375,6 +375,23 @@ impl Storage {
         println!("Server '{}' updated successfully!", new_name);
         Ok(new_name)
     }
+
+    /// Record a server launch by stamping `last_used` with the provided time closure and saving the config.
+    pub fn record_server_launch_with<F>(server_name: &str, now_fn: F) -> Result<()>
+    where
+        F: FnOnce() -> u64,
+    {
+        let mut config = Self::load_config()?;
+        if crate::models::stamp_server_in_slice(&mut config.servers, server_name, now_fn) {
+            Self::save_config(&config)?;
+        }
+        Ok(())
+    }
+
+    /// Record a server launch by stamping `last_used` with current epoch time and saving the config.
+    pub fn record_server_launch(server_name: &str) -> Result<()> {
+        Self::record_server_launch_with(server_name, crate::models::current_time_epoch_secs)
+    }
 }
 
 /// Parse the contents of `servers.json`, accepting both the new object
@@ -854,5 +871,19 @@ mod tests {
         let loaded = Storage::load_config().expect("load");
         let app = loaded.find_server("app").expect("app");
         assert_eq!(app.jump_host.as_deref(), Some("bastion-v2"));
+    }
+
+    #[test]
+    fn record_server_launch_stamps_and_persists() {
+        let _scope = ScopedConfigDir::new();
+        let mut cfg = Config::new();
+        cfg.servers.push(sample_server("srv"));
+        Storage::save_config(&cfg).expect("save");
+
+        Storage::record_server_launch_with("srv", || 1700000042).expect("launch record");
+
+        let loaded = Storage::load_config().expect("load");
+        let s = loaded.find_server("srv").expect("srv");
+        assert_eq!(s.last_used, Some(1700000042));
     }
 }
