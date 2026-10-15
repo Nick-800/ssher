@@ -1,5 +1,5 @@
 use crate::error::{Result, SshManagerError};
-use crate::models::{AuthEdit, AuthMethod, Config, Server, ServerEdit, TerminalConfig};
+use crate::models::{AuthEdit, AuthMethod, Config, Forward, Server, ServerEdit, TerminalConfig};
 use crate::ssh::Ssh;
 use std::fs;
 use std::path::PathBuf;
@@ -254,6 +254,63 @@ impl Storage {
             let lower = t.to_lowercase();
             if seen.insert(lower.clone()) {
                 result.push(lower);
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn validate_forward_host(host: &str) -> Result<()> {
+        if host.is_empty() {
+            return Err(SshManagerError::InvalidForward(
+                "Host cannot be empty".to_string(),
+            ));
+        }
+        if host.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    ';' | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '`'
+                        | '$'
+                        | '\\'
+                        | '"'
+                        | '\''
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '!'
+                        | '^'
+                        | '~'
+                        | ':'
+                )
+        }) {
+            return Err(SshManagerError::InvalidForward(format!(
+                "Host contains invalid characters: {}",
+                host
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn normalize_forwards<S: AsRef<str>>(specs: &[S]) -> Result<Vec<Forward>> {
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for spec in specs {
+            let s = spec.as_ref();
+            let forward = Forward::parse(s)?;
+            if seen.insert(forward.clone()) {
+                result.push(forward);
             }
         }
 
@@ -532,6 +589,67 @@ mod tests {
         assert!(matches!(
             Storage::normalize_tags(&input),
             Err(SshManagerError::InvalidTag(_))
+        ));
+    }
+
+    #[test]
+    fn validate_forward_host_accepts_valid() {
+        assert!(Storage::validate_forward_host("localhost").is_ok());
+        assert!(Storage::validate_forward_host("127.0.0.1").is_ok());
+        assert!(Storage::validate_forward_host("internal-db.corp.net").is_ok());
+    }
+
+    #[test]
+    fn validate_forward_host_rejects_empty_and_whitespace() {
+        assert!(matches!(
+            Storage::validate_forward_host(""),
+            Err(SshManagerError::InvalidForward(_))
+        ));
+        assert!(matches!(
+            Storage::validate_forward_host("host name"),
+            Err(SshManagerError::InvalidForward(_))
+        ));
+    }
+
+    #[test]
+    fn validate_forward_host_rejects_shell_metacharacters() {
+        for ch in [
+            ';', '&', '|', '<', '>', '`', '$', '\\', '"', '\'', '*', '?', '[', ']', '(', ')', '{',
+            '}', '!', '^', '~', ':',
+        ] {
+            let bad = format!("host{ch}name");
+            assert!(
+                matches!(
+                    Storage::validate_forward_host(&bad),
+                    Err(SshManagerError::InvalidForward(_))
+                ),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_forwards_deduplicates_and_preserves_order() {
+        let input = vec![
+            "5432".to_string(),
+            "L:5432:localhost:5432".to_string(),
+            "D:1080".to_string(),
+            "d:1080".to_string(),
+            "R:2222:internal.host:22".to_string(),
+        ];
+        let normalized = Storage::normalize_forwards(&input).expect("valid forwards");
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].to_string(), "L:5432:localhost:5432");
+        assert_eq!(normalized[1].to_string(), "D:1080");
+        assert_eq!(normalized[2].to_string(), "R:2222:internal.host:22");
+    }
+
+    #[test]
+    fn normalize_forwards_rejects_invalid() {
+        let input = vec!["5432".to_string(), "bad_spec".to_string()];
+        assert!(matches!(
+            Storage::normalize_forwards(&input),
+            Err(SshManagerError::InvalidForward(_))
         ));
     }
 

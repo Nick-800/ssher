@@ -7,6 +7,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Server Management**: Add, list, and remove SSH server configurations
 - **Flexible Authentication**: Support both SSH key and password-based authentication
 - **Jump Host / ProxyJump**: Support for bastion/jump hosts via saved server references or raw SSH jump specs, with chain resolution and cycle detection
+- **Port Forwarding Presets**: Local (-L), Remote (-R), and Dynamic (-D) port forwarding presets and ad-hoc connection forwards with port shorthand support
 - **Tags & Filtering**: Organize servers with tags, filter by tag sets, and search tags in the browser
 - **Secure Password Storage**: Passwords stored in OS keyring, never in plain text
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
@@ -77,6 +78,18 @@ ssher add internal-node 10.0.0.5 admin --key /path/to/key --jump bastion
 ssher add internal-node 10.0.0.5 admin --key /path/to/key --jump jumpuser@jump.example.com:2222
 ```
 
+Add a server with port forwarding presets (repeatable `--forward`):
+```bash
+# Shorthand bare-port notation expands to L:<port>:localhost:<port>
+ssher add db-server 10.0.0.6 dbuser --key /path/to/key --forward 5432
+
+# Explicit Local (-L), Remote (-R), and Dynamic SOCKS (-D) forwards
+ssher add web-server 10.0.0.7 admin --key /path/to/key \
+  --forward L:8080:localhost:80 \
+  --forward R:2222:localhost:22 \
+  --forward D:1080
+```
+
 ### List All Servers
 
 List all configured servers:
@@ -91,11 +104,11 @@ ssher list --tag prod --tag web
 
 Output:
 ```
-Name                 Host                 Username        Port       Auth         Agent FW   Via          Tags
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-myserver             example.com          username        22         key          no         -            prod, web
-internal-node        10.0.0.5             admin           22         key          no         bastion      -
-prod-server          prod.example.com     root            22         password     yes        -            -
+Name                 Host                 Username        Port       Auth         Agent FW   Via              Fwd      Tags
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myserver             example.com          username        22         key          no         -                1        prod, web
+internal-node        10.0.0.5             admin           22         key          no         bastion          -        -
+prod-server          prod.example.com     root            22         password     yes        -                -        -
 ```
 
 ### Connect to a Server
@@ -108,6 +121,17 @@ ssher connect my       # connects to myserver if it is the only matching server
 
 Options:
 - `-c`, `--current`: Connect directly in the current terminal instead of spawning an external window
+- `--forward <spec>`: Add ad-hoc port forwarding for this connection only (repeatable; accepts `L:<bind>:<host>:<port>`, `R:<bind>:<host>:<port>`, `D:<port>`, or bare port shorthand like `5432`)
+- `--no-forwards`: Do not apply saved port forwarding presets for this connection
+
+Ad-hoc port forwarding and bypassing presets:
+```bash
+# Connect with an ad-hoc local forward and dynamic proxy:
+ssher connect myserver --forward 8080 --forward D:1080
+
+# Connect without applying saved presets:
+ssher connect myserver --no-forwards
+```
 
 This will:
 1. Open a new terminal window (or connect in the current terminal with `-c`)
@@ -150,6 +174,12 @@ ssher edit myserver --jump bastion
 
 # Clear jump host
 ssher edit myserver --clear-jump
+
+# Replace port forwarding presets (repeatable, replaces current forwards)
+ssher edit myserver --forward 5432 --forward D:1080
+
+# Clear all port forwarding presets
+ssher edit myserver --clear-forwards
 ```
 
 ### Remove a Server
@@ -189,15 +219,15 @@ ssher
 
 Select **Browse Servers** to open the in-terminal server browser.
 
-The browser displays jump hosts and tags in dedicated `VIA` and `TAGS` columns for quick visibility.
+The browser displays jump hosts, port forward presets count, and tags in dedicated `VIA`, `FWD`, and `TAGS` columns for quick visibility.
 
 #### Browser Keybindings:
 - `j` / `k` or `↓` / `↑`: Move selection up/down
-- `Enter`: Connect to selected server (automatically routing through configured jump hosts)
-- `a`: Add a new server (prompts include comma-separated tags and optional jump host)
-- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host)
+- `Enter`: Connect to selected server (automatically routing through configured jump hosts and port forwards)
+- `a`: Add a new server (prompts include comma-separated tags, optional jump host, and comma-separated port forwards)
+- `e`: Edit selected server in place (prompts show current values in brackets; empty keeps current values, `-` clears optional jump host or port forwards)
 - `d`: Delete selected server (with y/n confirmation; blocked if referenced as a jump host)
-- `/`: Filter servers by name, host, tags, or jump host (case-insensitive substring)
+- `/`: Filter servers by name, host, tags, jump host, or port forwards (case-insensitive substring)
   - In filter mode: typed characters append to query, `Backspace` deletes, `Enter` applies filter, `Esc` clears filter
 - `Esc` / `q`: Return to main menu (in normal mode, `Esc` clears an active filter first if present)
 
@@ -281,7 +311,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward)
             _ssher "$@"
             return 0
             ;;
@@ -384,7 +414,10 @@ All configuration is stored in `~/.config/ssh_manager/`:
     "auth_method": "key",
     "key_path": "/home/user/.ssh/id_rsa",
     "use_agent_forwarding": false,
-    "jump_host": "bastion"
+    "jump_host": "bastion",
+    "forwards": [
+      "L:5432:localhost:5432"
+    ]
   },
   {
     "name": "prod-server",
@@ -424,6 +457,7 @@ The application provides clear error messages for common issues:
 - `Cannot remove server '...': referenced as jump host by: ...` — Server is referenced by other configurations
 - `Jump host cycle detected: ...` — Jump host chains cannot form a cycle
 - `Jump host chain exceeds maximum depth of 5 hops` — Jump chains cannot exceed 5 hops
+- `Invalid port forwarding specification: ...` — Forward specification is malformed or port is outside 1-65535
 
 ## Command Reference
 
@@ -436,6 +470,7 @@ ssher add <name> <host> <username> [OPTIONS]
   --agent-forwarding           Enable SSH agent forwarding
   --tag <tag>                  Server tag (repeatable)
   --jump <spec>                Jump host (saved server name or [user@]host[:port])
+  --forward <spec>             Port forward preset (repeatable; L:..., R:..., D:..., or port shorthand)
 
 # Edit a server
 ssher edit <name> [OPTIONS]
@@ -450,6 +485,8 @@ ssher edit <name> [OPTIONS]
   --clear-tags                 Clear all tags from server
   --jump <spec>                Set jump host (saved server name or [user@]host[:port])
   --clear-jump                 Clear jump host from server
+  --forward <spec>             Set port forwarding presets (repeatable, replaces current forwards)
+  --clear-forwards             Clear all port forwarding presets from server
 
 # List servers
 ssher list [OPTIONS]
@@ -458,6 +495,8 @@ ssher list [OPTIONS]
 # Connect to a server (exact name or unambiguous partial match)
 ssher connect <name> [OPTIONS]
   -c, --current                 Connect inline in current terminal
+  --forward <spec>             Ad-hoc port forward for this connection (repeatable)
+  --no-forwards                Do not apply saved port forwarding presets
 
 # Remove a server
 ssher remove <name>

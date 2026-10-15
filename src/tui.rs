@@ -306,7 +306,7 @@ impl Tui {
         let jump = crate::models::resolve_jump(config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
+        Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
         Ok(())
     }
 
@@ -505,6 +505,37 @@ impl Tui {
             Some(Some(jump_trimmed.to_string()))
         };
 
+        let current_forwards_desc = if server.forwards.is_empty() {
+            "none".to_string()
+        } else {
+            server
+                .forwards
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        print!(
+            "Port forwards (comma-separated) [{}]: ",
+            current_forwards_desc
+        );
+        io::stdout().flush()?;
+        let mut fwd_str = String::new();
+        io::stdin().read_line(&mut fwd_str)?;
+        let fwd_trimmed = fwd_str.trim();
+        let forwards = if fwd_trimmed.is_empty() {
+            None
+        } else if fwd_trimmed == "-" {
+            Some(Vec::new())
+        } else {
+            let specs: Vec<&str> = fwd_trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(Storage::normalize_forwards(&specs)?)
+        };
+
         let edit = ServerEdit {
             new_name,
             host,
@@ -514,6 +545,7 @@ impl Tui {
             agent_forwarding,
             tags,
             jump_host,
+            forwards,
         };
 
         let mut config = Storage::load_config()?;
@@ -715,10 +747,10 @@ impl Tui {
             f.render_widget(no_match_msg, chunks[1]);
         } else {
             let col_header = format!(
-                "  {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
-                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "VIA", "TAGS"
+                "  {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
+                "NAME", "HOST", "USER", "PORT", "AUTH", "AGENT FW", "VIA", "FWD", "TAGS"
             );
-            let separator = format!("  {}", "─".repeat(105));
+            let separator = format!("  {}", "─".repeat(110));
 
             let mut items = Vec::new();
             items.push(
@@ -738,6 +770,7 @@ impl Tui {
                 };
                 let af_str = if s.use_agent_forwarding { "yes" } else { "no" };
                 let via_str = s.jump_host.as_deref().unwrap_or("-");
+                let fwd_str = crate::models::format_forwards_summary(&s.forwards);
                 let tags_str = if s.tags.is_empty() {
                     "-".to_string()
                 } else {
@@ -746,8 +779,16 @@ impl Tui {
 
                 if view_idx == selected_index {
                     let line = format!(
-                        "▶ {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str, via_str, tags_str
+                        "▶ {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
+                        s.name,
+                        s.host,
+                        s.username,
+                        s.port,
+                        auth_str,
+                        af_str,
+                        via_str,
+                        fwd_str,
+                        tags_str
                     );
                     items.push(
                         ListItem::new(line).style(
@@ -758,8 +799,16 @@ impl Tui {
                     );
                 } else {
                     let line = format!(
-                        "  {:<18} {:<22} {:<12} {:<6} {:<10} {:<10} {:<15} {}",
-                        s.name, s.host, s.username, s.port, auth_str, af_str, via_str, tags_str
+                        "  {:<18} {:<20} {:<12} {:<6} {:<8} {:<9} {:<14} {:<5} {}",
+                        s.name,
+                        s.host,
+                        s.username,
+                        s.port,
+                        auth_str,
+                        af_str,
+                        via_str,
+                        fwd_str,
+                        tags_str
                     );
                     items.push(ListItem::new(line).style(Style::default().fg(Color::White)));
                 }
@@ -892,9 +941,9 @@ impl Tui {
     fn show_list() -> Result<()> {
         let config = crate::storage::Storage::load_config()?;
 
-        println!("\n{}", "=".repeat(122));
-        println!("{:^122}", "SSH SERVERS");
-        println!("{}", "=".repeat(122));
+        println!("\n{}", "=".repeat(131));
+        println!("{:^131}", "SSH SERVERS");
+        println!("{}", "=".repeat(131));
 
         if config.servers.is_empty() {
             println!("\nNo servers configured.\n");
@@ -902,10 +951,10 @@ impl Tui {
         }
 
         println!(
-            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
-            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Tags"
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
+            "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Fwd", "Tags"
         );
-        println!("{}", "─".repeat(122));
+        println!("{}", "─".repeat(131));
 
         for server in &config.servers {
             let auth = match server.auth_method {
@@ -918,6 +967,7 @@ impl Tui {
                 "no"
             };
             let via_str = server.jump_host.as_deref().unwrap_or("-");
+            let fwd_str = crate::models::format_forwards_summary(&server.forwards);
             let tags_str = if server.tags.is_empty() {
                 "-".to_string()
             } else {
@@ -925,7 +975,7 @@ impl Tui {
             };
 
             println!(
-                "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+                "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
                 server.name,
                 server.host,
                 server.username,
@@ -933,6 +983,7 @@ impl Tui {
                 auth,
                 agent_fw,
                 via_str,
+                fwd_str,
                 tags_str
             );
         }
@@ -1041,6 +1092,22 @@ impl Tui {
             Some(jump_trimmed.to_string())
         };
 
+        print!("Port forwards (comma-separated, optional): ");
+        io::stdout().flush()?;
+        let mut fwd_str = String::new();
+        io::stdin().read_line(&mut fwd_str)?;
+        let fwd_trimmed = fwd_str.trim();
+        let forwards = if fwd_trimmed.is_empty() || fwd_trimmed == "-" {
+            Vec::new()
+        } else {
+            let specs: Vec<&str> = fwd_trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            Storage::normalize_forwards(&specs)?
+        };
+
         let mut server = Server::new(
             name.to_string(),
             host.to_string(),
@@ -1052,6 +1119,7 @@ impl Tui {
         server.use_agent_forwarding = agent_forwarding;
         server.tags = tags;
         server.jump_host = jump_host;
+        server.forwards = forwards;
 
         config.servers.push(server);
         Storage::save_config(&config)?;
@@ -1094,7 +1162,7 @@ impl Tui {
         let jump = crate::models::resolve_jump(&config, server)?;
 
         println!("\nConnecting to {}...", server.name);
-        Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
+        Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &server.forwards)?;
 
         Ok(())
     }

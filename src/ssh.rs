@@ -1,5 +1,5 @@
 use crate::error::{Result, SshManagerError};
-use crate::models::{AuthMethod, Server};
+use crate::models::{AuthMethod, Forward, Server};
 use crate::terminal::Terminal;
 use keyring::Entry;
 use std::env;
@@ -15,7 +15,11 @@ impl Ssh {
     /// Build the argv for `ssh` itself, NOT including any password helper.
     /// The caller is responsible for configuring `SSH_ASKPASS` etc. if the
     /// server uses password authentication.
-    pub fn build_ssh_args(server: &Server, jump: Option<&str>) -> Vec<String> {
+    pub fn build_ssh_args(
+        server: &Server,
+        jump: Option<&str>,
+        forwards: &[Forward],
+    ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
 
         if let Some(key_path) = &server.key_path {
@@ -37,14 +41,43 @@ impl Ssh {
             args.push(server.port.to_string());
         }
 
+        for forward in forwards {
+            match forward {
+                Forward::Local {
+                    bind_port,
+                    host,
+                    host_port,
+                } => {
+                    args.push("-L".to_string());
+                    args.push(format!("{}:{}:{}", bind_port, host, host_port));
+                }
+                Forward::Remote {
+                    bind_port,
+                    host,
+                    host_port,
+                } => {
+                    args.push("-R".to_string());
+                    args.push(format!("{}:{}:{}", bind_port, host, host_port));
+                }
+                Forward::Dynamic { bind_port } => {
+                    args.push("-D".to_string());
+                    args.push(bind_port.to_string());
+                }
+            }
+        }
+
         args.push(format!("{}@{}", server.username, server.host));
         args
     }
 
     /// Build the full argv for spawning `ssh`, with `"ssh"` as argv[0].
-    pub fn build_ssh_argv(server: &Server, jump: Option<&str>) -> Vec<String> {
+    pub fn build_ssh_argv(
+        server: &Server,
+        jump: Option<&str>,
+        forwards: &[Forward],
+    ) -> Vec<String> {
         let mut argv = vec!["ssh".to_string()];
-        argv.extend(Self::build_ssh_args(server, jump));
+        argv.extend(Self::build_ssh_args(server, jump, forwards));
         argv
     }
 
@@ -93,8 +126,13 @@ impl Ssh {
 
     /// Launch SSH connection in a terminal. Passwords are passed via
     /// `SSH_ASKPASS`, never as command-line arguments.
-    pub fn launch_connection(server: &Server, terminal: &str, jump: Option<&str>) -> Result<()> {
-        let ssh_argv = Self::build_ssh_argv(server, jump);
+    pub fn launch_connection(
+        server: &Server,
+        terminal: &str,
+        jump: Option<&str>,
+        forwards: &[Forward],
+    ) -> Result<()> {
+        let ssh_argv = Self::build_ssh_argv(server, jump, forwards);
         let mut env: Vec<(String, String)> = Vec::new();
         let mut askpass_dir: Option<PathBuf> = None;
 
@@ -220,7 +258,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_key_default_port() {
-        let args = Ssh::build_ssh_args(&key_server(), None);
+        let args = Ssh::build_ssh_args(&key_server(), None, &[]);
         assert_eq!(
             args,
             vec![
@@ -237,13 +275,13 @@ mod tests {
         // the "no -p when default" branch.
         let mut s = password_server();
         s.port = 22;
-        let args = Ssh::build_ssh_args(&s, None);
+        let args = Ssh::build_ssh_args(&s, None, &[]);
         assert_eq!(args, vec!["bob@example.com".to_string()]);
     }
 
     #[test]
     fn build_ssh_args_custom_port() {
-        let args = Ssh::build_ssh_args(&password_server(), None);
+        let args = Ssh::build_ssh_args(&password_server(), None, &[]);
         assert_eq!(
             args,
             vec![
@@ -256,14 +294,14 @@ mod tests {
 
     #[test]
     fn build_ssh_args_agent_forwarding() {
-        let args = Ssh::build_ssh_args(&forward_server(), None);
+        let args = Ssh::build_ssh_args(&forward_server(), None, &[]);
         assert!(args.contains(&"-A".to_string()));
         assert!(args.contains(&"-i".to_string()));
     }
 
     #[test]
     fn build_ssh_argv_starts_with_ssh() {
-        let argv = Ssh::build_ssh_argv(&forward_server(), None);
+        let argv = Ssh::build_ssh_argv(&forward_server(), None, &[]);
         assert_eq!(argv.first().map(String::as_str), Some("ssh"));
         assert!(argv.contains(&"-A".to_string()));
     }
@@ -273,7 +311,7 @@ mod tests {
         // Regression: the password must never leak into the argv.
         let mut s = password_server();
         s.key_path = Some("/should-not-see".to_string());
-        let args = Ssh::build_ssh_args(&s, None);
+        let args = Ssh::build_ssh_args(&s, None, &[]);
         let joined = args.join("\n");
         assert!(!joined.contains("hunter2"));
         assert!(!joined.contains("'"));
@@ -281,7 +319,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_with_jump_host() {
-        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"));
+        let args = Ssh::build_ssh_args(&key_server(), Some("bastion.example.com"), &[]);
         assert_eq!(
             args,
             vec![
@@ -296,11 +334,56 @@ mod tests {
 
     #[test]
     fn build_ssh_argv_with_jump_host() {
-        let argv = Ssh::build_ssh_argv(&forward_server(), Some("jump1,jump2"));
+        let argv = Ssh::build_ssh_argv(&forward_server(), Some("jump1,jump2"), &[]);
         assert_eq!(argv.first().map(String::as_str), Some("ssh"));
         assert!(argv.contains(&"-J".to_string()));
         assert!(argv.contains(&"jump1,jump2".to_string()));
         assert!(argv.contains(&"-A".to_string()));
+    }
+
+    #[test]
+    fn build_ssh_args_with_local_forward() {
+        let f = Forward::Local {
+            bind_port: 5432,
+            host: "localhost".to_string(),
+            host_port: 5432,
+        };
+        let args = Ssh::build_ssh_args(&key_server(), None, &[f]);
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-L".to_string(),
+                "5432:localhost:5432".to_string(),
+                "alice@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_args_with_remote_and_dynamic_forwards() {
+        let forwards = vec![
+            Forward::Remote {
+                bind_port: 2222,
+                host: "internal.box".to_string(),
+                host_port: 22,
+            },
+            Forward::Dynamic { bind_port: 1080 },
+        ];
+        let args = Ssh::build_ssh_args(&key_server(), None, &forwards);
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-R".to_string(),
+                "2222:internal.box:22".to_string(),
+                "-D".to_string(),
+                "1080".to_string(),
+                "alice@example.com".to_string(),
+            ]
+        );
     }
 
     #[test]

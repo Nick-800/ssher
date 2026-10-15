@@ -90,6 +90,9 @@ pub enum SshManagerError {
 
     #[error("Cannot remove server '{0}': referenced as jump host by: {1}")]
     ServerReferencedAsJumpHost(String, String),
+
+    #[error("Invalid port forwarding specification: {0}")]
+    InvalidForward(String),
 }
 
 pub type Result<T> = std::result::Result<T, SshManagerError>;

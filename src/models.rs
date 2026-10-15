@@ -10,6 +10,183 @@ pub enum AuthMethod {
     Password,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Forward {
+    Local {
+        bind_port: u16,
+        host: String,
+        host_port: u16,
+    },
+    Remote {
+        bind_port: u16,
+        host: String,
+        host_port: u16,
+    },
+    Dynamic {
+        bind_port: u16,
+    },
+}
+
+impl Forward {
+    pub fn parse(spec: &str) -> Result<Self> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return Err(SshManagerError::InvalidForward(
+                "Forward specification cannot be empty".to_string(),
+            ));
+        }
+
+        if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            let port: u16 = trimmed.parse().map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(port)?;
+            return Ok(Forward::Local {
+                bind_port: port,
+                host: "localhost".to_string(),
+                host_port: port,
+            });
+        }
+
+        if trimmed.starts_with("L:") || trimmed.starts_with("l:") {
+            let parts: Vec<&str> = trimmed[2..].split(':').collect();
+            if parts.len() != 3 {
+                return Err(SshManagerError::InvalidForward(format!(
+                    "Invalid local forward specification '{}': expected L:<bind_port>:<host>:<host_port>",
+                    spec
+                )));
+            }
+            let bind_port: u16 = parts[0].parse().map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(bind_port)?;
+            Storage::validate_forward_host(parts[1])?;
+            let host_port: u16 = parts[2].parse().map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(host_port)?;
+            return Ok(Forward::Local {
+                bind_port,
+                host: parts[1].to_string(),
+                host_port,
+            });
+        }
+
+        if trimmed.starts_with("R:") || trimmed.starts_with("r:") {
+            let parts: Vec<&str> = trimmed[2..].split(':').collect();
+            if parts.len() != 3 {
+                return Err(SshManagerError::InvalidForward(format!(
+                    "Invalid remote forward specification '{}': expected R:<bind_port>:<host>:<host_port>",
+                    spec
+                )));
+            }
+            let bind_port: u16 = parts[0].parse().map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(bind_port)?;
+            Storage::validate_forward_host(parts[1])?;
+            let host_port: u16 = parts[2].parse().map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(host_port)?;
+            return Ok(Forward::Remote {
+                bind_port,
+                host: parts[1].to_string(),
+                host_port,
+            });
+        }
+
+        if trimmed.starts_with("D:") || trimmed.starts_with("d:") {
+            let remainder = &trimmed[2..];
+            if remainder.is_empty() || remainder.contains(':') {
+                return Err(SshManagerError::InvalidForward(format!(
+                    "Invalid dynamic forward specification '{}': expected D:<bind_port>",
+                    spec
+                )));
+            }
+            let bind_port: u16 = remainder
+                .parse()
+                .map_err(|_| SshManagerError::InvalidPort)?;
+            Storage::validate_port(bind_port)?;
+            return Ok(Forward::Dynamic { bind_port });
+        }
+
+        Err(SshManagerError::InvalidForward(format!(
+            "Invalid forward specification '{}': expected L:..., R:..., D:..., or port shorthand",
+            spec
+        )))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Forward::Local {
+                bind_port,
+                host,
+                host_port,
+            }
+            | Forward::Remote {
+                bind_port,
+                host,
+                host_port,
+            } => {
+                Storage::validate_port(*bind_port)?;
+                Storage::validate_forward_host(host)?;
+                Storage::validate_port(*host_port)?;
+            }
+            Forward::Dynamic { bind_port } => {
+                Storage::validate_port(*bind_port)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn dedupe(forwards: &[Forward]) -> Vec<Forward> {
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for f in forwards {
+            if seen.insert(f.clone()) {
+                result.push(f.clone());
+            }
+        }
+        result
+    }
+}
+
+impl std::fmt::Display for Forward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Forward::Local {
+                bind_port,
+                host,
+                host_port,
+            } => write!(f, "L:{}:{}:{}", bind_port, host, host_port),
+            Forward::Remote {
+                bind_port,
+                host,
+                host_port,
+            } => write!(f, "R:{}:{}:{}", bind_port, host, host_port),
+            Forward::Dynamic { bind_port } => write!(f, "D:{}", bind_port),
+        }
+    }
+}
+
+impl std::str::FromStr for Forward {
+    type Err = SshManagerError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Forward::parse(s)
+    }
+}
+
+impl Serialize for Forward {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Forward {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Forward::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Server {
     pub name: String,
@@ -25,6 +202,8 @@ pub struct Server {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<Forward>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +255,7 @@ impl Server {
             use_agent_forwarding: false,
             tags: Vec::new(),
             jump_host: None,
+            forwards: Vec::new(),
         }
     }
 }
@@ -90,6 +270,7 @@ pub struct ServerEdit {
     pub agent_forwarding: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub jump_host: Option<Option<String>>,
+    pub forwards: Option<Vec<Forward>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +289,7 @@ impl ServerEdit {
             && self.agent_forwarding.is_none()
             && self.tags.is_none()
             && self.jump_host.is_none()
+            && self.forwards.is_none()
     }
 
     pub fn apply(&self, server: &mut Server, config: &Config) -> Result<()> {
@@ -216,12 +398,27 @@ impl ServerEdit {
         if let Some(jump) = &self.jump_host {
             server.jump_host = jump.clone();
         }
+        if let Some(forwards) = &self.forwards {
+            for f in forwards {
+                f.validate()?;
+            }
+            server.forwards = Forward::dedupe(forwards);
+        }
 
         Ok(())
     }
 }
 
-/// Check if a server matches a case-insensitive query across its name, host, tags, or jump host.
+/// Format a count or compact summary of forwards for tabular display ("-" when none).
+pub fn format_forwards_summary(forwards: &[Forward]) -> String {
+    if forwards.is_empty() {
+        "-".to_string()
+    } else {
+        forwards.len().to_string()
+    }
+}
+
+/// Check if a server matches a case-insensitive query across its name, host, tags, jump host, or forwards.
 /// An empty query matches every server.
 pub fn server_matches_query(server: &Server, query: &str) -> bool {
     if query.is_empty() {
@@ -236,6 +433,10 @@ pub fn server_matches_query(server: &Server, query: &str) -> bool {
             .as_ref()
             .map(|j| j.to_lowercase().contains(&q))
             .unwrap_or(false)
+        || server
+            .forwards
+            .iter()
+            .any(|f| f.to_string().to_lowercase().contains(&q))
 }
 
 /// Resolve the `-J` argument for a server, expanding saved servers into `user@host:port`
@@ -1845,5 +2046,169 @@ Match host other
         s.jump_host = Some("bastion.corp".to_string());
         assert!(server_matches_query(&s, "bastion"));
         assert!(!server_matches_query(&s, "otherproxy"));
+    }
+
+    #[test]
+    fn forward_parse_shorthand() {
+        let f = Forward::parse("5432").unwrap();
+        assert_eq!(
+            f,
+            Forward::Local {
+                bind_port: 5432,
+                host: "localhost".to_string(),
+                host_port: 5432,
+            }
+        );
+        assert_eq!(f.to_string(), "L:5432:localhost:5432");
+    }
+
+    #[test]
+    fn forward_parse_canonical_and_case_insensitive() {
+        let local = Forward::parse("L:8080:127.0.0.1:80").unwrap();
+        assert_eq!(
+            local,
+            Forward::Local {
+                bind_port: 8080,
+                host: "127.0.0.1".to_string(),
+                host_port: 80,
+            }
+        );
+        assert_eq!(local.to_string(), "L:8080:127.0.0.1:80");
+
+        let local_lower = Forward::parse("l:8080:127.0.0.1:80").unwrap();
+        assert_eq!(local_lower, local);
+
+        let remote = Forward::parse("R:2222:internal.host:22").unwrap();
+        assert_eq!(
+            remote,
+            Forward::Remote {
+                bind_port: 2222,
+                host: "internal.host".to_string(),
+                host_port: 22,
+            }
+        );
+        assert_eq!(remote.to_string(), "R:2222:internal.host:22");
+
+        let dynamic = Forward::parse("D:1080").unwrap();
+        assert_eq!(dynamic, Forward::Dynamic { bind_port: 1080 });
+        assert_eq!(dynamic.to_string(), "D:1080");
+
+        let dynamic_lower = Forward::parse("d:1080").unwrap();
+        assert_eq!(dynamic_lower, dynamic);
+    }
+
+    #[test]
+    fn forward_parse_invalid() {
+        assert!(Forward::parse("").is_err());
+        assert!(Forward::parse("   ").is_err());
+        assert!(Forward::parse("0").is_err());
+        assert!(Forward::parse("65536").is_err());
+        assert!(Forward::parse("L:0:localhost:80").is_err());
+        assert!(Forward::parse("L:80:localhost:0").is_err());
+        assert!(Forward::parse("L:80::80").is_err());
+        assert!(Forward::parse("L:80:bad host:80").is_err());
+        assert!(Forward::parse("L:80:bad;host:80").is_err());
+        assert!(Forward::parse("L:80:bad$host:80").is_err());
+        assert!(Forward::parse("D:0").is_err());
+        assert!(Forward::parse("D:1080:extra").is_err());
+        assert!(Forward::parse("X:1080").is_err());
+    }
+
+    #[test]
+    fn forward_dedupe() {
+        let forwards = vec![
+            Forward::parse("5432").unwrap(),
+            Forward::parse("L:5432:localhost:5432").unwrap(),
+            Forward::parse("D:1080").unwrap(),
+            Forward::parse("D:1080").unwrap(),
+        ];
+        let deduped = Forward::dedupe(&forwards);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].to_string(), "L:5432:localhost:5432");
+        assert_eq!(deduped[1].to_string(), "D:1080");
+    }
+
+    #[test]
+    fn server_parses_from_json_without_forwards_backward_compat() {
+        let json = r#"{
+            "name": "srv",
+            "host": "1.2.3.4",
+            "username": "alice",
+            "port": 22,
+            "auth_method": "key"
+        }"#;
+        let s: Server = serde_json::from_str(json).unwrap();
+        assert!(s.forwards.is_empty());
+    }
+
+    #[test]
+    fn server_forwards_omitted_when_empty() {
+        let s = sample_server("srv");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("forwards"));
+    }
+
+    #[test]
+    fn server_round_trips_through_json_with_forwards() {
+        let mut s = sample_server("srv");
+        s.forwards = vec![
+            Forward::parse("5432").unwrap(),
+            Forward::parse("R:2222:host:22").unwrap(),
+            Forward::parse("D:1080").unwrap(),
+        ];
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("\"forwards\":[\"L:5432:localhost:5432\",\"R:2222:host:22\",\"D:1080\"]")
+        );
+
+        let deserialized: Server = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.forwards, s.forwards);
+    }
+
+    #[test]
+    fn edit_apply_forwards() {
+        let mut s = sample_server("srv");
+        let cfg = Config::new();
+        let edit = ServerEdit {
+            forwards: Some(vec![
+                Forward::parse("5432").unwrap(),
+                Forward::parse("D:1080").unwrap(),
+            ]),
+            ..Default::default()
+        };
+        edit.apply(&mut s, &cfg).unwrap();
+        assert_eq!(s.forwards.len(), 2);
+
+        // Clear forwards
+        let clear_edit = ServerEdit {
+            forwards: Some(Vec::new()),
+            ..Default::default()
+        };
+        clear_edit.apply(&mut s, &cfg).unwrap();
+        assert!(s.forwards.is_empty());
+    }
+
+    #[test]
+    fn edit_apply_forwards_validation_failures() {
+        let mut s = sample_server("srv");
+        let cfg = Config::new();
+        let bad_edit = ServerEdit {
+            forwards: Some(vec![Forward::Local {
+                bind_port: 0,
+                host: "localhost".to_string(),
+                host_port: 80,
+            }]),
+            ..Default::default()
+        };
+        assert!(bad_edit.apply(&mut s, &cfg).is_err());
+    }
+
+    #[test]
+    fn server_matches_query_with_forwards() {
+        let mut s = sample_server("srv");
+        s.forwards = vec![Forward::parse("5432").unwrap()];
+        assert!(server_matches_query(&s, "5432"));
+        assert!(server_matches_query(&s, "localhost"));
+        assert!(!server_matches_query(&s, "9999"));
     }
 }

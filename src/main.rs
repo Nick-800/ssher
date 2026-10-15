@@ -50,6 +50,9 @@ enum Commands {
         /// SSH jump host (saved server name or [user@]host[:port])
         #[arg(long = "jump")]
         jump: Option<String>,
+        /// Port forwarding preset (repeatable, e.g. 5432, L:8080:localhost:80, R:2222:host:22, D:1080)
+        #[arg(long = "forward", action = clap::ArgAction::Append)]
+        forward: Vec<String>,
     },
 
     /// Modify a saved SSH server
@@ -89,6 +92,12 @@ enum Commands {
         /// Clear jump host from server
         #[arg(long, conflicts_with = "jump")]
         clear_jump: bool,
+        /// Set port forwarding presets (repeatable, replaces current forwards)
+        #[arg(long = "forward", conflicts_with = "clear_forwards", action = clap::ArgAction::Append)]
+        forward: Option<Vec<String>>,
+        /// Clear all port forwarding presets from server
+        #[arg(long, conflicts_with = "forward")]
+        clear_forwards: bool,
     },
 
     /// List all saved SSH servers
@@ -105,6 +114,12 @@ enum Commands {
         /// Connect directly in current terminal instead of spawning an external window
         #[arg(short, long)]
         current: bool,
+        /// Ad-hoc port forwarding (repeatable)
+        #[arg(long = "forward", action = clap::ArgAction::Append)]
+        forward: Vec<String>,
+        /// Do not apply saved port forwarding presets
+        #[arg(long = "no-forwards")]
+        no_forwards: bool,
     },
 
     /// Remove a saved SSH server
@@ -188,6 +203,7 @@ fn run(cli: Cli) -> Result<()> {
             agent_forwarding,
             tag,
             jump,
+            forward,
         } => add_server(
             name,
             AddArgs {
@@ -199,6 +215,7 @@ fn run(cli: Cli) -> Result<()> {
                 agent_forwarding,
                 tags: tag,
                 jump,
+                forwards: forward,
             },
         ),
         Commands::Edit {
@@ -214,12 +231,21 @@ fn run(cli: Cli) -> Result<()> {
             clear_tags,
             jump,
             clear_jump,
+            forward,
+            clear_forwards,
         } => {
             let tags = if clear_tags { Some(Vec::new()) } else { tag };
             let jump_host = if clear_jump {
                 Some(None)
             } else {
                 jump.map(Some)
+            };
+            let forwards = if clear_forwards {
+                Some(Vec::new())
+            } else {
+                forward
+                    .map(|f| Storage::normalize_forwards(&f))
+                    .transpose()?
             };
             edit_server(
                 name,
@@ -233,11 +259,17 @@ fn run(cli: Cli) -> Result<()> {
                     new_name,
                     tags,
                     jump_host,
+                    forwards,
                 },
             )
         }
         Commands::List { tag } => list_servers(&tag),
-        Commands::Connect { name, current } => connect_server(&name, current),
+        Commands::Connect {
+            name,
+            current,
+            forward,
+            no_forwards,
+        } => connect_server(&name, current, &forward, no_forwards),
         Commands::Remove { name } => remove_server(&name),
         Commands::Import {
             file,
@@ -266,6 +298,7 @@ struct AddArgs {
     agent_forwarding: bool,
     tags: Vec<String>,
     jump: Option<String>,
+    forwards: Vec<String>,
 }
 
 fn add_server(name: String, args: AddArgs) -> Result<()> {
@@ -275,6 +308,7 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     Storage::validate_username(&args.username)?;
     Storage::validate_port(args.port)?;
     let normalized_tags = Storage::normalize_tags(&args.tags)?;
+    let normalized_forwards = Storage::normalize_forwards(&args.forwards)?;
 
     let mut config = Storage::load_config()?;
 
@@ -333,6 +367,7 @@ fn add_server(name: String, args: AddArgs) -> Result<()> {
     server.use_agent_forwarding = args.agent_forwarding;
     server.tags = normalized_tags;
     server.jump_host = args.jump;
+    server.forwards = normalized_forwards;
 
     config.servers.push(server);
     Storage::save_config(&config)?;
@@ -371,10 +406,10 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
     }
 
     println!(
-        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
-        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Tags"
+        "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
+        "Name", "Host", "Username", "Port", "Auth", "Agent FW", "Via", "Fwd", "Tags"
     );
-    println!("{}", "─".repeat(122));
+    println!("{}", "─".repeat(131));
 
     for server in matching_servers {
         let auth = match server.auth_method {
@@ -387,6 +422,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
             "no"
         };
         let via_str = server.jump_host.as_deref().unwrap_or("-");
+        let fwd_str = models::format_forwards_summary(&server.forwards);
         let tags_str = if server.tags.is_empty() {
             "-".to_string()
         } else {
@@ -394,7 +430,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
         };
 
         println!(
-            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<20}",
+            "{:<20} {:<20} {:<15} {:<8} {:<10} {:<10} {:<16} {:<8} {:<20}",
             server.name,
             server.host,
             server.username,
@@ -402,6 +438,7 @@ fn list_servers(filter_tags: &[String]) -> Result<()> {
             auth,
             agent_fw,
             via_str,
+            fwd_str,
             tags_str
         );
     }
@@ -419,6 +456,7 @@ struct EditArgs {
     new_name: Option<String>,
     tags: Option<Vec<String>>,
     jump_host: Option<Option<String>>,
+    forwards: Option<Vec<models::Forward>>,
 }
 
 fn edit_server(name: String, args: EditArgs) -> Result<()> {
@@ -431,6 +469,7 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         && args.new_name.is_none()
         && args.tags.is_none()
         && args.jump_host.is_none()
+        && args.forwards.is_none()
     {
         return Err(error::SshManagerError::NothingToChange);
     }
@@ -470,17 +509,37 @@ fn edit_server(name: String, args: EditArgs) -> Result<()> {
         agent_forwarding: args.agent_forwarding,
         tags: args.tags,
         jump_host: args.jump_host,
+        forwards: args.forwards,
     };
 
     Storage::execute_server_edit(&mut config, &name, edit, new_password)?;
     Ok(())
 }
 
-fn connect_server(name: &str, force_current: bool) -> Result<()> {
+fn connect_server(
+    name: &str,
+    force_current: bool,
+    adhoc_specs: &[String],
+    no_forwards: bool,
+) -> Result<()> {
     let config = Storage::load_config()?;
 
     let server = config.resolve_server(name)?;
     let jump = models::resolve_jump(&config, server)?;
+
+    let adhoc_forwards = Storage::normalize_forwards(adhoc_specs)?;
+
+    let mut effective_forwards = if no_forwards {
+        Vec::new()
+    } else {
+        server.forwards.clone()
+    };
+
+    for f in adhoc_forwards {
+        if !effective_forwards.contains(&f) {
+            effective_forwards.push(f);
+        }
+    }
 
     // Get terminal to use
     let terminal_name = if force_current {
@@ -490,7 +549,7 @@ fn connect_server(name: &str, force_current: bool) -> Result<()> {
     };
 
     println!("Connecting to {}...", server.name);
-    Ssh::launch_connection(server, &terminal_name, jump.as_deref())?;
+    Ssh::launch_connection(server, &terminal_name, jump.as_deref(), &effective_forwards)?;
 
     Ok(())
 }
@@ -667,7 +726,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward)
             _ssher "$@"
             return 0
             ;;
@@ -825,6 +884,8 @@ mod tests {
                 clear_tags,
                 jump,
                 clear_jump,
+                forward,
+                clear_forwards,
             } => {
                 assert_eq!(name, "myserver");
                 assert_eq!(host.as_deref(), Some("example.com"));
@@ -838,6 +899,8 @@ mod tests {
                 assert!(!clear_tags);
                 assert_eq!(jump, None);
                 assert!(!clear_jump);
+                assert_eq!(forward, None);
+                assert!(!clear_forwards);
             }
             _ => panic!("expected Commands::Edit"),
         }
@@ -949,9 +1012,183 @@ mod tests {
     fn cli_connect_partial_name_arg() {
         let cli = Cli::try_parse_from(["ssher", "connect", "prod"]).unwrap();
         match cli.command {
-            Commands::Connect { name, current } => {
+            Commands::Connect {
+                name,
+                current,
+                forward,
+                no_forwards,
+            } => {
                 assert_eq!(name, "prod");
                 assert!(!current);
+                assert!(forward.is_empty());
+                assert!(!no_forwards);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_add_forwards() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "add",
+            "srv",
+            "1.2.3.4",
+            "root",
+            "--key",
+            "/path/to/key",
+            "--forward",
+            "5432",
+            "--forward",
+            "R:2222:host:22",
+            "--forward",
+            "D:1080",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Add { forward, .. } => {
+                assert_eq!(
+                    forward,
+                    vec![
+                        "5432".to_string(),
+                        "R:2222:host:22".to_string(),
+                        "D:1080".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_forwards() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "edit",
+            "srv",
+            "--forward",
+            "L:8080:localhost:80",
+            "--forward",
+            "3000",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                forward,
+                clear_forwards,
+                ..
+            } => {
+                assert_eq!(
+                    forward,
+                    Some(vec!["L:8080:localhost:80".to_string(), "3000".to_string()])
+                );
+                assert!(!clear_forwards);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_clear_forwards() {
+        let cli = Cli::try_parse_from(["ssher", "edit", "srv", "--clear-forwards"]).unwrap();
+
+        match cli.command {
+            Commands::Edit {
+                forward,
+                clear_forwards,
+                ..
+            } => {
+                assert_eq!(forward, None);
+                assert!(clear_forwards);
+            }
+            _ => panic!("expected Commands::Edit"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_edit_forwards_and_clear_forwards_conflict() {
+        let res = Cli::try_parse_from([
+            "ssher",
+            "edit",
+            "srv",
+            "--forward",
+            "5432",
+            "--clear-forwards",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cli_parse_connect_forwards() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "connect",
+            "prod",
+            "--forward",
+            "8080",
+            "--forward",
+            "D:1080",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                forward,
+                no_forwards,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(forward, vec!["8080".to_string(), "D:1080".to_string()]);
+                assert!(!no_forwards);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_connect_no_forwards() {
+        let cli = Cli::try_parse_from(["ssher", "connect", "prod", "--no-forwards"]).unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                forward,
+                no_forwards,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert!(forward.is_empty());
+                assert!(no_forwards);
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_connect_forwards_with_no_forwards() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "connect",
+            "prod",
+            "--forward",
+            "8080",
+            "--no-forwards",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Connect {
+                name,
+                forward,
+                no_forwards,
+                ..
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(forward, vec!["8080".to_string()]);
+                assert!(no_forwards);
             }
             _ => panic!("expected Commands::Connect"),
         }
@@ -1013,6 +1250,7 @@ mod tests {
         assert!(bash.contains("__complete-tags"));
         assert!(bash.contains("_ssher_complete"));
         assert!(bash.contains("--jump"));
+        assert!(bash.contains("--forward"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
