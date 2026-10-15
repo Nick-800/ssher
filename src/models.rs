@@ -740,6 +740,65 @@ pub fn toggle_server_favorite(servers: &mut [Server], name: &str) -> Option<bool
     }
 }
 
+/// Derive the public key path for `copy-id`.
+///
+/// If an explicit path is provided via `--pub` or `--key`, it is used (appending `.pub`
+/// if it does not already end in `.pub`).
+/// If no explicit path is provided, key-auth servers default to `<key_path>.pub`.
+/// Password-auth servers without an explicit path return an error instructing the user
+/// to provide `--key` or `--pub`.
+pub fn derive_copy_id_pub_path(server: &Server, explicit_path: Option<&str>) -> Result<String> {
+    if let Some(path) = explicit_path {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(SshManagerError::InvalidConfig(
+                "Public key path cannot be empty".to_string(),
+            ));
+        }
+        if trimmed.ends_with(".pub") {
+            Ok(trimmed.to_string())
+        } else {
+            Ok(format!("{}.pub", trimmed))
+        }
+    } else {
+        match server.auth_method {
+            AuthMethod::Key => {
+                if let Some(key_path) = &server.key_path {
+                    if key_path.ends_with(".pub") {
+                        Ok(key_path.clone())
+                    } else {
+                        Ok(format!("{}.pub", key_path))
+                    }
+                } else {
+                    Err(SshManagerError::InvalidConfig(format!(
+                        "Server '{}' is configured for key authentication but has no key path",
+                        server.name
+                    )))
+                }
+            }
+            AuthMethod::Password => Err(SshManagerError::InvalidConfig(format!(
+                "Server '{}' uses password authentication; specify a key with --key or --pub (e.g. ssher copy-id {} --key ~/.ssh/id_ed25519)",
+                server.name, server.name
+            ))),
+        }
+    }
+}
+
+/// Pure transformation switching a server to key authentication using the private key
+/// corresponding to `pub_path` (pub_path minus `.pub`).
+pub fn switch_server_to_key(server: &mut Server, pub_path: &str) -> Result<String> {
+    let priv_path = pub_path.strip_suffix(".pub").ok_or_else(|| {
+        SshManagerError::InvalidConfig(format!(
+            "Public key path '{}' does not end in '.pub'",
+            pub_path
+        ))
+    })?;
+
+    server.auth_method = AuthMethod::Key;
+    server.key_path = Some(priv_path.to_string());
+    Ok(priv_path.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalConfig {
     pub terminal: String,
@@ -2653,5 +2712,169 @@ Match host other
         let servers = vec![sample_server("s1")];
         let err = select_exec_targets(&servers, None, &[], false).unwrap_err();
         assert!(matches!(err, SshManagerError::NoServersMatch));
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_key_server_default() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Key,
+            Some("/home/user/.ssh/id_ed25519".to_string()),
+        );
+        let path = derive_copy_id_pub_path(&server, None).unwrap();
+        assert_eq!(path, "/home/user/.ssh/id_ed25519.pub");
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_key_server_explicit_pub() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Key,
+            Some("/home/user/.ssh/id_ed25519".to_string()),
+        );
+        let path = derive_copy_id_pub_path(&server, Some("/custom/key.pub")).unwrap();
+        assert_eq!(path, "/custom/key.pub");
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_key_server_explicit_private() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Key,
+            Some("/home/user/.ssh/id_ed25519".to_string()),
+        );
+        let path = derive_copy_id_pub_path(&server, Some("/custom/key")).unwrap();
+        assert_eq!(path, "/custom/key.pub");
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_password_server_explicit_pub() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        let path = derive_copy_id_pub_path(&server, Some("/home/user/.ssh/id_rsa.pub")).unwrap();
+        assert_eq!(path, "/home/user/.ssh/id_rsa.pub");
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_password_server_explicit_private() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        let path = derive_copy_id_pub_path(&server, Some("/home/user/.ssh/id_rsa")).unwrap();
+        assert_eq!(path, "/home/user/.ssh/id_rsa.pub");
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_password_server_missing_explicit_errors() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        let err = derive_copy_id_pub_path(&server, None).unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidConfig(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("password authentication"));
+        assert!(msg.contains("--key") || msg.contains("--pub"));
+    }
+
+    #[test]
+    fn derive_copy_id_pub_path_empty_explicit_errors() {
+        let server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Key,
+            Some("/home/user/.ssh/id_ed25519".to_string()),
+        );
+        let err = derive_copy_id_pub_path(&server, Some("   ")).unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn switch_server_to_key_password_server() {
+        let mut server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        assert_eq!(server.auth_method, AuthMethod::Password);
+        assert_eq!(server.key_path, None);
+
+        let priv_path =
+            switch_server_to_key(&mut server, "/home/user/.ssh/id_ed25519.pub").unwrap();
+        assert_eq!(priv_path, "/home/user/.ssh/id_ed25519");
+        assert_eq!(server.auth_method, AuthMethod::Key);
+        assert_eq!(
+            server.key_path,
+            Some("/home/user/.ssh/id_ed25519".to_string())
+        );
+    }
+
+    #[test]
+    fn switch_server_to_key_rejects_non_pub_path() {
+        let mut server = Server::new(
+            "srv".to_string(),
+            "example.com".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+        let err = switch_server_to_key(&mut server, "/home/user/.ssh/id_ed25519").unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn server_parses_from_json_copy_id_backward_compat() {
+        let json = r#"{
+            "name": "legacy-pw",
+            "host": "example.com",
+            "username": "bob",
+            "port": 2222,
+            "auth_method": "password"
+        }"#;
+        let mut server: Server = serde_json::from_str(json).unwrap();
+        assert_eq!(server.auth_method, AuthMethod::Password);
+        assert_eq!(server.key_path, None);
+
+        let derived =
+            derive_copy_id_pub_path(&server, Some("/home/bob/.ssh/id_ed25519.pub")).unwrap();
+        assert_eq!(derived, "/home/bob/.ssh/id_ed25519.pub");
+
+        let priv_key = switch_server_to_key(&mut server, &derived).unwrap();
+        assert_eq!(priv_key, "/home/bob/.ssh/id_ed25519");
+        assert_eq!(server.auth_method, AuthMethod::Key);
+        assert_eq!(
+            server.key_path,
+            Some("/home/bob/.ssh/id_ed25519".to_string())
+        );
     }
 }

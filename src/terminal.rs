@@ -31,10 +31,15 @@ impl Terminal {
         Err(SshManagerError::TerminalNotFound)
     }
 
+    /// Check if a binary exists in PATH.
+    pub fn command_exists(command: &str) -> bool {
+        find_in_path(command).is_some()
+    }
+
     /// Check if a terminal emulator exists in PATH. Exposed as `pub(crate)`
     /// for tests that need to seed `PATH` with a fake binary.
     pub(crate) fn terminal_exists(terminal: &str) -> bool {
-        find_in_path(terminal).is_some()
+        Self::command_exists(terminal)
     }
 
     /// Spawn a terminal running the given argv. The first element of `argv`

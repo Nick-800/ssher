@@ -134,6 +134,38 @@ impl Ssh {
         argv
     }
 
+    /// Build the argv for `ssh-copy-id`, NOT including `ssh-copy-id` as argv[0].
+    pub fn build_copy_id_args(server: &Server, jump: Option<&str>, pub_path: &str) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+
+        args.push("-i".to_string());
+        args.push(pub_path.to_string());
+
+        // Do NOT add `-o IdentityFile=<saved key>` here: ssh-copy-id's
+        // "already installed?" probe reuses these options, so the saved key
+        // would log in and every new key would be skipped as a duplicate.
+        // Key-auth servers authenticate through ssh-agent / default identities.
+        if let Some(jump_spec) = jump {
+            args.push("-o".to_string());
+            args.push(format!("ProxyJump={}", jump_spec));
+        }
+
+        if server.port != 22 {
+            args.push("-p".to_string());
+            args.push(server.port.to_string());
+        }
+
+        args.push(format!("{}@{}", server.username, server.host));
+        args
+    }
+
+    /// Build the full argv for spawning `ssh-copy-id`, with `"ssh-copy-id"` as argv[0].
+    pub fn build_copy_id_argv(server: &Server, jump: Option<&str>, pub_path: &str) -> Vec<String> {
+        let mut argv = vec!["ssh-copy-id".to_string()];
+        argv.extend(Self::build_copy_id_args(server, jump, pub_path));
+        argv
+    }
+
     /// Normalize uncommon local TERM values (e.g. `xterm-kitty`, `alacritty`)
     /// to `xterm-256color` so remote servers lacking specialized terminfo databases
     /// do not produce "unknown terminal type" errors.
@@ -294,6 +326,66 @@ impl Ssh {
 
         let status = status_res.map_err(|e| {
             SshManagerError::SshLaunchFailed(format!("Failed to execute {}: {}", ssh_argv[0], e))
+        })?;
+
+        Ok(status)
+    }
+
+    /// Check if `ssh-copy-id` is installed on PATH.
+    pub fn copy_id_exists() -> bool {
+        crate::terminal::Terminal::command_exists("ssh-copy-id")
+    }
+
+    /// Execute `ssh-copy-id` in the current terminal with inherited stdio.
+    /// Password authentication reuses the temporary SSH_ASKPASS helper.
+    pub fn execute_copy_id(
+        server: &Server,
+        jump: Option<&str>,
+        pub_path: &str,
+    ) -> Result<std::process::ExitStatus> {
+        if !Self::copy_id_exists() {
+            return Err(SshManagerError::SshCopyIdNotFound);
+        }
+
+        let copy_id_argv = Self::build_copy_id_argv(server, jump, pub_path);
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut askpass_dir: Option<PathBuf> = None;
+
+        if let Ok(current_term) = env::var("TERM") {
+            if let Some(normalized) = Self::normalize_term(&current_term) {
+                env.push(("TERM".to_string(), normalized.to_string()));
+            }
+        }
+
+        if server.auth_method == AuthMethod::Password {
+            let password = Self::get_password(&server.name)?;
+            let dir = setup_askpass(&password)?;
+            let script = dir.join("askpass.sh");
+            env.push((
+                "SSH_ASKPASS".to_string(),
+                script.to_string_lossy().into_owned(),
+            ));
+            env.push(("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()));
+            askpass_dir = Some(dir);
+        }
+
+        let mut cmd = std::process::Command::new(&copy_id_argv[0]);
+        cmd.args(&copy_id_argv[1..]);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+
+        let status_res = cmd.status();
+
+        if let Some(dir) = askpass_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        let status = status_res.map_err(|e| {
+            SshManagerError::SshLaunchFailed(format!(
+                "Failed to execute {}: {}",
+                copy_id_argv[0], e
+            ))
         })?;
 
         Ok(status)
@@ -620,5 +712,91 @@ mod tests {
         let argv = Ssh::build_exec_argv(&key_server(), None, false, "hostname");
         assert_eq!(argv[0], "ssh");
         assert_eq!(argv.last().map(String::as_str), Some("hostname"));
+    }
+
+    #[test]
+    fn build_copy_id_args_default_port() {
+        let args = Ssh::build_copy_id_args(&key_server(), None, "/home/alice/.ssh/id_ed25519.pub");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519.pub".to_string(),
+                "alice@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_copy_id_args_custom_port() {
+        let args = Ssh::build_copy_id_args(&password_server(), None, "/home/bob/.ssh/id_rsa.pub");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/bob/.ssh/id_rsa.pub".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "bob@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_copy_id_args_with_jump_host() {
+        let args = Ssh::build_copy_id_args(
+            &key_server(),
+            Some("bastion.example.com"),
+            "/home/alice/.ssh/id_ed25519.pub",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519.pub".to_string(),
+                "-o".to_string(),
+                "ProxyJump=bastion.example.com".to_string(),
+                "alice@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_copy_id_args_with_chained_jump_host_and_custom_port() {
+        let args = Ssh::build_copy_id_args(
+            &password_server(),
+            Some("jump1@box:22,jump2@box:22"),
+            "/home/bob/.ssh/id_rsa.pub",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/bob/.ssh/id_rsa.pub".to_string(),
+                "-o".to_string(),
+                "ProxyJump=jump1@box:22,jump2@box:22".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "bob@example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_copy_id_argv_starts_with_ssh_copy_id() {
+        let argv = Ssh::build_copy_id_argv(&key_server(), None, "/home/alice/.ssh/id_ed25519.pub");
+        assert_eq!(argv[0], "ssh-copy-id");
+        assert_eq!(argv[1], "-i");
+        assert_eq!(argv[2], "/home/alice/.ssh/id_ed25519.pub");
+        assert_eq!(argv.last().map(String::as_str), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn build_copy_id_args_password_never_present() {
+        let s = password_server();
+        let args = Ssh::build_copy_id_args(&s, None, "/home/bob/.ssh/id_rsa.pub");
+        let joined = args.join("\n");
+        assert!(!joined.contains("password"));
+        assert!(!joined.contains("hunter2"));
     }
 }

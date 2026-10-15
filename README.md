@@ -16,6 +16,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **SSH Config Import**: Import host configurations from `~/.ssh/config` or custom files with dry-run support
 - **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name and jump host completion
 - **Remote Command Execution**: Run one-off remote commands inline (`ssher exec`) on single servers, tag sets, or all servers with sequential execution and BatchMode protection
+- **Public Key Installation**: Install public SSH keys on saved servers (`ssher copy-id`), with jump host support, `SSH_ASKPASS` password delivery, and optional switching to key authentication (`--switch-to-key`)
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -24,7 +25,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - Linux operating system
 - Rust 1.70+ (for building)
 - One of the following terminal emulators: `gnome-terminal`, `konsole`, `xfce4-terminal`, or `xterm`
-- `openssh-client` (usually pre-installed on most Linux distributions)
+- `openssh-client` (providing `ssh` and `ssh-copy-id`, usually pre-installed on most Linux distributions)
 
 ## Installation
 
@@ -211,6 +212,32 @@ ssher exec myserver -- "hostname && uptime"
 ssher exec myserver -- echo "'hello world'"
 ```
 
+### Install SSH Public Key (copy-id)
+
+Install your public key on a saved SSH server wrapping `ssh-copy-id`:
+
+```bash
+# Install the default public key (<key_path>.pub) on a key-auth server
+ssher copy-id myserver
+
+# Install a specific public key (or private key path, which appends .pub)
+ssher copy-id myserver --pub ~/.ssh/id_ed25519.pub
+ssher copy-id myserver --key ~/.ssh/id_ed25519
+
+# Install public key on a password-authenticated server and switch it to key auth
+ssher copy-id password-server --key ~/.ssh/id_ed25519 --switch-to-key
+```
+
+#### Behavior & Options:
+- `<name>`: Saved server name (supports exact match or unique partial-name resolution).
+- Default public key: for key-auth servers, defaults to the server's configured `key_path` + `.pub`. For password-auth servers, `--key <private-or-pub path>` or `--pub <path>` is required.
+- `--pub <path>`: Path to public key file.
+- `--key <path>`: Path to private or public key file (if path does not end in `.pub`, `.pub` is automatically appended).
+- Missing key file: if the `.pub` file does not exist, `ssher` exits with a clear error naming the missing path (keys are never generated automatically).
+- Jump hosts: if the server is configured with a jump host, `-o ProxyJump=...` is automatically passed with the fully resolved jump chain.
+- Password authentication: for password servers, `ssher` supplies the stored password securely using the `SSH_ASKPASS` helper (the password never appears on a command line or in the process table).
+- `--switch-to-key`: upon successful exit of `ssh-copy-id` on a password-authenticated server, updates the server configuration to Key authentication with the private key path (`pub path minus ".pub"`), saves the configuration, and removes the password from the OS keyring.
+
 ### Edit a Server
 
 Modify an existing server configuration in place:
@@ -363,7 +390,7 @@ ssher completions powershell | Out-String | Invoke-Expression
 
 #### Dynamic Server Name and Tag Completion
 
-For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names (for `connect`, `edit`, `remove`, and `--jump`) and distinct server tags (for `--tag`) via the hidden subcommands:
+For Bash, Zsh, and Fish, the generated completion scripts automatically wire dynamic completion of saved server names (for `connect`, `edit`, `remove`, `copy-id`, and `--jump`) and distinct server tags (for `--tag`) via the hidden subcommands:
 
 ```bash
 ssher __complete-servers
@@ -381,7 +408,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub)
             _ssher "$@"
             return 0
             ;;
@@ -406,7 +433,7 @@ _ssher_complete() {
     local subcmd=""
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove|fav|unfav)
+            connect|edit|remove|fav|unfav|exec|copy-id)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -580,6 +607,12 @@ ssher exec --tag <tag> [--tag <tag2>] -- <command...>
 ssher exec --all -- <command...>
   --tag <tag>                   Filter servers by tag (repeatable, must match all)
   --all                         Run on all configured servers
+
+# Install public key on server (wrapping ssh-copy-id)
+ssher copy-id <name> [OPTIONS]
+  --pub <path>                  Public key file path (e.g. ~/.ssh/id_ed25519.pub)
+  --key <path>                  Private or public key file path (e.g. ~/.ssh/id_ed25519)
+  --switch-to-key               Switch server to key authentication upon success
 
 # Remove a server
 ssher remove <name>

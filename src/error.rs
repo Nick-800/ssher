@@ -64,6 +64,9 @@ pub enum SshManagerError {
     #[allow(dead_code)]
     SshpassNotInstalled,
 
+    #[error("ssh-copy-id is not installed. Please install OpenSSH client tools")]
+    SshCopyIdNotFound,
+
     #[error("Failed to set up SSH_ASKPASS helper: {0}")]
     AskspassSetupFailed(String),
 

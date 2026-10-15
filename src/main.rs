@@ -154,6 +154,25 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Install public key on a saved SSH server using ssh-copy-id
+    #[command(name = "copy-id")]
+    CopyId {
+        /// Server name to copy SSH key to
+        name: String,
+
+        /// Path to public key file (e.g. ~/.ssh/id_ed25519.pub)
+        #[arg(long = "pub", conflicts_with = "key")]
+        pub_path: Option<String>,
+
+        /// Path to private or public key file (e.g. ~/.ssh/id_ed25519)
+        #[arg(long = "key", conflicts_with = "pub_path")]
+        key: Option<String>,
+
+        /// Switch server to key authentication after successful copy
+        #[arg(long = "switch-to-key")]
+        switch_to_key: bool,
+    },
+
     /// Remove a saved SSH server
     Remove {
         /// Server name to remove
@@ -320,6 +339,18 @@ fn run(cli: Cli) -> Result<()> {
             all,
             command,
         } => exec_servers(target, tag, all, command),
+        Commands::CopyId {
+            name,
+            pub_path,
+            key,
+            switch_to_key,
+        } => copy_id_server(
+            &name,
+            CopyIdArgs {
+                explicit_key: pub_path.or(key),
+                switch_to_key,
+            },
+        ),
         Commands::Remove { name } => remove_server(&name),
         Commands::Fav { name } => set_favorite(&name, true),
         Commands::Unfav { name } => set_favorite(&name, false),
@@ -725,6 +756,68 @@ fn exec_servers(
     }
 }
 
+struct CopyIdArgs {
+    explicit_key: Option<String>,
+    switch_to_key: bool,
+}
+
+fn copy_id_server(name: &str, args: CopyIdArgs) -> Result<()> {
+    let mut config = Storage::load_config()?;
+    let server = config.resolve_server(name)?;
+    let server_name = server.name.clone();
+
+    let raw_pub_path = models::derive_copy_id_pub_path(server, args.explicit_key.as_deref())?;
+    let pub_path_buf = expand_tilde_path(std::path::Path::new(&raw_pub_path))?;
+    let pub_path_str = pub_path_buf.to_string_lossy().into_owned();
+
+    if !pub_path_buf.exists() || !pub_path_buf.is_file() {
+        return Err(error::SshManagerError::KeyFileNotFound(pub_path_str));
+    }
+
+    let jump = models::resolve_jump(&config, server)?;
+
+    let status = Ssh::execute_copy_id(server, jump.as_deref(), &pub_path_str)?;
+
+    if !status.success() {
+        let code = status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map(|s| 128 + s).unwrap_or(1)
+            }
+            #[cfg(not(unix))]
+            {
+                1
+            }
+        });
+        std::process::exit(code);
+    }
+
+    if args.switch_to_key {
+        let idx = config
+            .servers
+            .iter()
+            .position(|s| s.name == server_name)
+            .ok_or_else(|| error::SshManagerError::ServerNotFound(server_name.clone()))?;
+
+        let old_auth = config.servers[idx].auth_method.clone();
+        let priv_path = models::switch_server_to_key(&mut config.servers[idx], &pub_path_str)?;
+
+        Storage::save_config(&config)?;
+
+        if old_auth == models::AuthMethod::Password {
+            let _ = Ssh::delete_password(&server_name);
+        }
+
+        println!(
+            "Server '{}' switched to key authentication ({})",
+            server_name, priv_path
+        );
+    }
+
+    Ok(())
+}
+
 fn remove_server(name: &str) -> Result<()> {
     let mut config = Storage::load_config()?;
 
@@ -897,7 +990,7 @@ _ssher_complete() {
     local prev="${3:-${COMP_WORDS[COMP_CWORD-1]}}"
 
     case "${prev}" in
-        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward)
+        --host|--username|--port|--key|--agent-forwarding|--new-name|--forward|--pub)
             _ssher "$@"
             return 0
             ;;
@@ -926,7 +1019,7 @@ _ssher_complete() {
     local subcmd=""
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove|fav|unfav|exec)
+            connect|edit|remove|fav|unfav|exec|copy-id)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -958,8 +1051,8 @@ fi
         }
         clap_complete::Shell::Fish => {
             let fish_snippet = r#"
-# Dynamic server completion for connect, edit, remove, fav, unfav, exec
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec" -f -a "(ssher __complete-servers)"
+# Dynamic server completion for connect, edit, remove, fav, unfav, exec, copy-id
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec copy-id" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 complete -c ssher -l sort -f -a "recent name"
@@ -987,6 +1080,10 @@ complete -c ssher -l sort -f -a "recent name"
                 .replace(
                     ":name -- Server name to unfavorite:_default",
                     ":name -- Server name to unfavorite:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to copy SSH key to:_default",
+                    ":name -- Server name to copy SSH key to:_ssher_servers",
                 )
                 .replace(":JUMP:_default", ":JUMP:_ssher_servers")
                 .replace(
@@ -1481,7 +1578,7 @@ mod tests {
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
         assert!(bash.contains("--sort"));
-        assert!(bash.contains("connect|edit|remove|fav|unfav|exec"));
+        assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
@@ -1491,12 +1588,13 @@ mod tests {
         assert!(zsh.contains(":JUMP:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to favorite:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to unfavorite:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to copy SSH key to:_ssher_servers"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
-        assert!(fish.contains("connect edit remove fav unfav exec"));
+        assert!(fish.contains("connect edit remove fav unfav exec copy-id"));
         assert!(fish.contains("-l jump"));
         assert!(fish.contains("-l sort"));
     }
@@ -1689,5 +1787,122 @@ mod tests {
         assert!(Cli::try_parse_from(["ssher", "exec", "myserver"]).is_err());
         assert!(Cli::try_parse_from(["ssher", "exec", "--all"]).is_err());
         assert!(Cli::try_parse_from(["ssher", "exec", "myserver", "--"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_copy_id_defaults() {
+        let cli = Cli::try_parse_from(["ssher", "copy-id", "myserver"]).unwrap();
+        match cli.command {
+            Commands::CopyId {
+                name,
+                pub_path,
+                key,
+                switch_to_key,
+            } => {
+                assert_eq!(name, "myserver");
+                assert_eq!(pub_path, None);
+                assert_eq!(key, None);
+                assert!(!switch_to_key);
+            }
+            _ => panic!("expected Commands::CopyId"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_copy_id_pub_flag() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "copy-id",
+            "myserver",
+            "--pub",
+            "/home/user/.ssh/id_ed25519.pub",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CopyId {
+                name,
+                pub_path,
+                key,
+                switch_to_key,
+            } => {
+                assert_eq!(name, "myserver");
+                assert_eq!(pub_path, Some("/home/user/.ssh/id_ed25519.pub".to_string()));
+                assert_eq!(key, None);
+                assert!(!switch_to_key);
+            }
+            _ => panic!("expected Commands::CopyId"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_copy_id_key_flag() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "copy-id",
+            "myserver",
+            "--key",
+            "/home/user/.ssh/id_ed25519",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CopyId {
+                name,
+                pub_path,
+                key,
+                switch_to_key,
+            } => {
+                assert_eq!(name, "myserver");
+                assert_eq!(pub_path, None);
+                assert_eq!(key, Some("/home/user/.ssh/id_ed25519".to_string()));
+                assert!(!switch_to_key);
+            }
+            _ => panic!("expected Commands::CopyId"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_copy_id_switch_to_key() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "copy-id",
+            "myserver",
+            "--pub",
+            "/home/user/.ssh/id_ed25519.pub",
+            "--switch-to-key",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CopyId {
+                name,
+                pub_path,
+                key,
+                switch_to_key,
+            } => {
+                assert_eq!(name, "myserver");
+                assert_eq!(pub_path, Some("/home/user/.ssh/id_ed25519.pub".to_string()));
+                assert_eq!(key, None);
+                assert!(switch_to_key);
+            }
+            _ => panic!("expected Commands::CopyId"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_copy_id_pub_and_key_conflict() {
+        assert!(Cli::try_parse_from([
+            "ssher",
+            "copy-id",
+            "myserver",
+            "--pub",
+            "/path/to/key.pub",
+            "--key",
+            "/path/to/key",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn cli_parse_copy_id_missing_name_errors() {
+        assert!(Cli::try_parse_from(["ssher", "copy-id"]).is_err());
     }
 }
