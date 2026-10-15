@@ -14,6 +14,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Terminal Flexibility**: User-configurable terminal emulator (gnome-terminal, xterm, etc.)
 - **SSH Options**: Support for custom ports, SSH agent forwarding, identity files, and jump hosts
 - **SSH Config Import**: Import host configurations from `~/.ssh/config` or custom files with dry-run support
+- **Export & Backup**: Export servers and configuration to pretty JSON (`ssher export`) to file or stdout (with mode 0600 permissions), and import backups (`ssher import-backup`) with validation, collision handling, and password-auth reminders
 - **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name and jump host completion
 - **Remote Command Execution**: Run one-off remote commands inline (`ssher exec`) on single servers, tag sets, or all servers with sequential execution and BatchMode protection
 - **Public Key Installation**: Install public SSH keys on saved servers (`ssher copy-id`), with jump host support, `SSH_ASKPASS` password delivery, and optional switching to key authentication (`--switch-to-key`)
@@ -373,6 +374,43 @@ ssher import --skip-existing
 
 The import command parses `Host` blocks with key-based authentication (`IdentityFile`), honoring `HostName`, `User`, `Port`, and `ForwardAgent`. Host entries without an `IdentityFile` are skipped with a warning.
 
+### Export Servers
+
+Export server configurations (and preferred terminal settings) to pretty JSON:
+
+```bash
+# Export all servers to stdout (passwords are stored in the keyring and never exported)
+ssher export
+
+# Export to a file with mode 0600 permissions
+ssher export --file /path/to/backup.json
+
+# Overwrite an existing backup file
+ssher export --file /path/to/backup.json --force
+
+# Export servers filtered by tag (repeatable; matches servers with all specified tags)
+ssher export --tag prod --tag web --file /path/to/prod_backup.json
+```
+
+When exporting to stdout, a warning is emitted to stderr reminding that passwords are not exported and password-auth servers must be re-saved.
+
+### Import from Backup
+
+Import servers from a backup JSON file (or legacy bare-array format):
+
+```bash
+# Import servers from backup file
+ssher import-backup /path/to/backup.json
+
+# Overwrite existing servers with matching names
+ssher import-backup /path/to/backup.json --overwrite
+
+# Preview what would be imported without modifying configuration
+ssher import-backup /path/to/backup.json --dry-run
+```
+
+The import validates each server with storage validators (missing key files produce a warning while keeping the server). Name collisions are skipped unless `--overwrite` is specified. Keyrings are never modified; any imported password-auth servers without stored passwords are listed in the summary with the exact command to configure their password (`ssher edit <name> --password`).
+
 ### Interactive TUI & Server Browser
 
 Launch the interactive TUI by running `ssher` with no arguments:
@@ -706,6 +744,17 @@ ssher import [OPTIONS]
   -f, --file <path>             Path to SSH config file (default: ~/.ssh/config)
   --dry-run                     Preview import without modifying configuration
   --skip-existing               Skip hosts that collide with existing server names
+
+# Export servers and configuration to JSON
+ssher export [OPTIONS]
+  --file <path>                 Path to output backup file (writes to stdout if omitted)
+  --tag <tag>                   Filter servers to export by tag (repeatable, must match all)
+  --force                       Overwrite existing destination file
+
+# Import servers from backup JSON file
+ssher import-backup <file> [OPTIONS]
+  --overwrite                   Overwrite existing servers with matching names
+  --dry-run                     Preview import without modifying configuration
 
 # Configure settings
 ssher config terminal <terminal-name>

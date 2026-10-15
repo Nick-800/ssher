@@ -232,6 +232,36 @@ enum Commands {
         skip_existing: bool,
     },
 
+    /// Export servers and configuration to JSON
+    Export {
+        /// File path to export to (writes to stdout if omitted)
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Filter servers to export by tag (repeatable, must have all tags)
+        #[arg(long = "tag", action = clap::ArgAction::Append)]
+        tag: Vec<String>,
+
+        /// Overwrite destination file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Import servers from a backup JSON file
+    #[command(name = "import-backup")]
+    ImportBackup {
+        /// Path to the backup JSON file
+        file: std::path::PathBuf,
+
+        /// Overwrite existing servers with matching names
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Preview what would be imported without modifying configuration
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -416,6 +446,12 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             skip_existing,
         }),
+        Commands::Export { file, tag, force } => export_servers(file, tag, force),
+        Commands::ImportBackup {
+            file,
+            overwrite,
+            dry_run,
+        } => import_backup(file, overwrite, dry_run),
         Commands::Completions { shell } => generate_completions(shell),
         Commands::Ping { name, tag, timeout } => ping_servers_cli(name.as_deref(), &tag, timeout),
         Commands::CompleteServers => complete_servers(),
@@ -1114,6 +1150,66 @@ fn import_servers(args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
+fn export_servers(file: Option<std::path::PathBuf>, tags: Vec<String>, force: bool) -> Result<()> {
+    let config = Storage::load_config()?;
+    let export_cfg = models::export_config(&config, &tags)?;
+    let json = serde_json::to_string_pretty(&export_cfg)?;
+
+    match file {
+        Some(path) => {
+            Storage::export_to_file(&path, &json, force)?;
+            println!(
+                "Exported {} server(s) to {}",
+                export_cfg.servers.len(),
+                path.display()
+            );
+        }
+        None => {
+            eprintln!("passwords are not exported; password-auth servers must be re-saved");
+            let mut stdout = io::stdout();
+            stdout.write_all(json.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn import_backup(file: std::path::PathBuf, overwrite: bool, dry_run: bool) -> Result<()> {
+    let content = std::fs::read_to_string(&file)?;
+    let backup_config = Storage::parse_servers_file(&content)?;
+
+    let mut config = Storage::load_config()?;
+    let had_password_auth: std::collections::HashSet<String> = config
+        .servers
+        .iter()
+        .filter(|s| s.auth_method == AuthMethod::Password)
+        .map(|s| s.name.clone())
+        .collect();
+
+    let result = models::import_backup_servers(
+        &mut config,
+        backup_config,
+        overwrite,
+        |key_path| Storage::validate_key_path(key_path).is_ok(),
+        |name| had_password_auth.contains(name),
+    );
+
+    for warning in &result.warnings {
+        eprintln!("Warning: {}", warning);
+    }
+
+    if !dry_run {
+        Storage::save_config(&config)?;
+    } else {
+        println!("Dry run mode: no changes written to configuration.");
+    }
+
+    println!("{}", result.summary_text());
+    Ok(())
+}
+
 pub fn generate_completion_script(shell: clap_complete::Shell) -> String {
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
@@ -1164,7 +1260,7 @@ _ssher_complete() {
                 subcmd_idx=$i
                 break
                 ;;
-            add|list|import|completions|config|help)
+            add|list|import|completions|config|help|export|import-backup)
                 break
                 ;;
         esac
@@ -2219,5 +2315,91 @@ mod tests {
     #[test]
     fn cli_parse_ping_name_and_tag_conflict() {
         assert!(Cli::try_parse_from(["ssher", "ping", "myserver", "--tag", "prod"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_export_defaults() {
+        let cli = Cli::try_parse_from(["ssher", "export"]).unwrap();
+        match cli.command {
+            Commands::Export { file, tag, force } => {
+                assert!(file.is_none());
+                assert!(tag.is_empty());
+                assert!(!force);
+            }
+            _ => panic!("expected Commands::Export"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_export_file_and_tags_and_force() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "export",
+            "--file",
+            "/tmp/backup.json",
+            "--tag",
+            "prod",
+            "--tag",
+            "web",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Export { file, tag, force } => {
+                assert_eq!(
+                    file.as_deref(),
+                    Some(std::path::Path::new("/tmp/backup.json"))
+                );
+                assert_eq!(tag, vec!["prod", "web"]);
+                assert!(force);
+            }
+            _ => panic!("expected Commands::Export"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_import_backup_defaults() {
+        let cli = Cli::try_parse_from(["ssher", "import-backup", "/tmp/backup.json"]).unwrap();
+        match cli.command {
+            Commands::ImportBackup {
+                file,
+                overwrite,
+                dry_run,
+            } => {
+                assert_eq!(file, std::path::PathBuf::from("/tmp/backup.json"));
+                assert!(!overwrite);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Commands::ImportBackup"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_import_backup_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "import-backup",
+            "/tmp/backup.json",
+            "--overwrite",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ImportBackup {
+                file,
+                overwrite,
+                dry_run,
+            } => {
+                assert_eq!(file, std::path::PathBuf::from("/tmp/backup.json"));
+                assert!(overwrite);
+                assert!(dry_run);
+            }
+            _ => panic!("expected Commands::ImportBackup"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_import_backup_missing_file_errors() {
+        assert!(Cli::try_parse_from(["ssher", "import-backup"]).is_err());
     }
 }

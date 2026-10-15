@@ -392,12 +392,55 @@ impl Storage {
     pub fn record_server_launch(server_name: &str) -> Result<()> {
         Self::record_server_launch_with(server_name, crate::models::current_time_epoch_secs)
     }
+    pub fn parse_servers_file(content: &str) -> Result<Config> {
+        parse_servers_file(content)
+    }
+
+    pub fn export_to_file(path: &std::path::Path, content: &str, force: bool) -> Result<()> {
+        if path.exists() && !force {
+            return Err(SshManagerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "File '{}' already exists (use --force to overwrite)",
+                    path.display()
+                ),
+            )));
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        if force {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(path)?;
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
+    }
 }
 
 /// Parse the contents of `servers.json`, accepting both the new object
 /// format (`{"servers":[...], "preferred_terminal":...}`) and the legacy
 /// bare-array format (`[...]`) for backwards compatibility.
-fn parse_servers_file(content: &str) -> Result<Config> {
+pub fn parse_servers_file(content: &str) -> Result<Config> {
     if let Ok(cfg) = serde_json::from_str::<Config>(content) {
         return Ok(cfg);
     }
@@ -885,5 +928,55 @@ mod tests {
         let loaded = Storage::load_config().expect("load");
         let s = loaded.find_server("srv").expect("srv");
         assert_eq!(s.last_used, Some(1700000042));
+    }
+
+    #[test]
+    fn export_to_file_creates_mode_0600_and_respects_force() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "ssher_export_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&unique_dir).expect("create temp dir");
+        let export_path = unique_dir.join("backup.json");
+
+        let content1 = r#"{"servers":[]}"#;
+        Storage::export_to_file(&export_path, content1, false).expect("export should succeed");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&export_path).expect("metadata");
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "file mode must be 0600");
+        }
+
+        // Refuse to overwrite without force
+        let err = Storage::export_to_file(&export_path, content1, false)
+            .expect_err("should refuse to overwrite without force");
+        assert!(matches!(
+            err,
+            SshManagerError::IoError(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+
+        // Overwrite with force
+        let content2 = r#"{"servers":[],"preferred_terminal":"xterm"}"#;
+        Storage::export_to_file(&export_path, content2, true)
+            .expect("force overwrite should succeed");
+        let read_back = std::fs::read_to_string(&export_path).expect("read");
+        assert!(read_back.contains("preferred_terminal"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&export_path).expect("metadata");
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "file mode must remain 0600 after overwrite");
+        }
+
+        let _ = std::fs::remove_dir_all(&unique_dir);
     }
 }

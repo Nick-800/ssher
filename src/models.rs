@@ -1485,6 +1485,239 @@ pub fn filter_and_map_imported_hosts(
     ImportResult { to_import, skipped }
 }
 
+/// Filter servers by tag (must match all specified tags, case-insensitive).
+/// If `tags` is empty, returns all servers.
+pub fn filter_servers_by_tags<'a>(
+    servers: &'a [Server],
+    tags: &[String],
+) -> Result<Vec<&'a Server>> {
+    if tags.is_empty() {
+        return Ok(servers.iter().collect());
+    }
+
+    for tag in tags {
+        Storage::validate_tag(tag)?;
+    }
+
+    let normalized: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    let matches: Vec<&'a Server> = servers
+        .iter()
+        .filter(|server| {
+            normalized
+                .iter()
+                .all(|ft| server.tags.iter().any(|st| st == ft))
+        })
+        .collect();
+
+    Ok(matches)
+}
+
+/// Create an export Config containing filtered servers and preferred terminal.
+pub fn export_config(config: &Config, tags: &[String]) -> Result<Config> {
+    let filtered_servers = filter_servers_by_tags(&config.servers, tags)?;
+    Ok(Config {
+        servers: filtered_servers.into_iter().cloned().collect(),
+        preferred_terminal: config.preferred_terminal.clone(),
+    })
+}
+
+/// Result of an import-backup operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBackupResult {
+    pub imported: usize,
+    pub skipped: usize,
+    pub overwritten: usize,
+    pub needs_password: Vec<String>,
+    pub skipped_details: Vec<(String, String)>,
+    pub warnings: Vec<String>,
+}
+
+impl ImportBackupResult {
+    pub fn summary_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "imported {}, skipped {}, overwritten {}",
+            self.imported, self.skipped, self.overwritten
+        ));
+        if !self.needs_password.is_empty() {
+            lines.push("needs password:".to_string());
+            for name in &self.needs_password {
+                lines.push(format!(
+                    "  - {}: needs password: ssher edit {} --password",
+                    name, name
+                ));
+            }
+        }
+        if !self.skipped_details.is_empty() {
+            lines.push("Skipped servers:".to_string());
+            for (name, reason) in &self.skipped_details {
+                lines.push(format!("  - {}: {}", name, reason));
+            }
+        }
+        if !self.warnings.is_empty() {
+            lines.push("Warnings:".to_string());
+            for w in &self.warnings {
+                lines.push(format!("  - {}", w));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+/// Pure helper to validate and import servers from a backup configuration into the existing configuration.
+pub fn import_backup_servers(
+    existing_config: &mut Config,
+    backup_config: Config,
+    overwrite: bool,
+    validate_key_exists: impl Fn(&str) -> bool,
+    has_stored_password: impl Fn(&str) -> bool,
+) -> ImportBackupResult {
+    let mut imported = 0;
+    let mut skipped = 0;
+    let mut overwritten = 0;
+    let mut needs_password = Vec::new();
+    let mut skipped_details = Vec::new();
+    let mut warnings = Vec::new();
+
+    let initial_names: std::collections::HashSet<String> = existing_config
+        .servers
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    let mut overwritten_names = std::collections::HashSet::new();
+
+    for mut server in backup_config.servers {
+        if let Err(e) = Storage::validate_server_name(&server.name) {
+            skipped += 1;
+            skipped_details.push((
+                if server.name.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    server.name.clone()
+                },
+                format!("Invalid server name: {}", e),
+            ));
+            continue;
+        }
+
+        if let Err(e) = Storage::validate_host(&server.host) {
+            skipped += 1;
+            skipped_details.push((server.name.clone(), format!("Invalid host: {}", e)));
+            continue;
+        }
+
+        if let Err(e) = Storage::validate_username(&server.username) {
+            skipped += 1;
+            skipped_details.push((server.name.clone(), format!("Invalid username: {}", e)));
+            continue;
+        }
+
+        if let Err(e) = Storage::validate_port(server.port) {
+            skipped += 1;
+            skipped_details.push((server.name.clone(), format!("Invalid port: {}", e)));
+            continue;
+        }
+
+        match Storage::normalize_tags(&server.tags) {
+            Ok(normalized) => server.tags = normalized,
+            Err(e) => {
+                skipped += 1;
+                skipped_details.push((server.name.clone(), format!("Invalid tags: {}", e)));
+                continue;
+            }
+        }
+
+        if let Some(jump) = &server.jump_host {
+            if let Err(e) = Storage::validate_jump_host(jump) {
+                skipped += 1;
+                skipped_details.push((server.name.clone(), format!("Invalid jump host: {}", e)));
+                continue;
+            }
+            if jump == &server.name {
+                skipped += 1;
+                skipped_details.push((
+                    server.name.clone(),
+                    "Server cannot use itself as a jump host".to_string(),
+                ));
+                continue;
+            }
+        }
+
+        let mut forwards_valid = true;
+        for forward in &server.forwards {
+            if let Err(e) = forward.validate() {
+                skipped += 1;
+                skipped_details.push((server.name.clone(), format!("Invalid forward: {}", e)));
+                forwards_valid = false;
+                break;
+            }
+        }
+        if !forwards_valid {
+            continue;
+        }
+        server.forwards = Forward::dedupe(&server.forwards);
+
+        if server.auth_method == AuthMethod::Key {
+            if let Some(key_path) = &server.key_path {
+                if !validate_key_exists(key_path) {
+                    warnings.push(format!(
+                        "Server '{}': SSH key file not found: {}",
+                        server.name, key_path
+                    ));
+                }
+            }
+        }
+
+        let existing_pos = existing_config
+            .servers
+            .iter()
+            .position(|s| s.name == server.name);
+
+        if let Some(idx) = existing_pos {
+            let is_pre_existing = initial_names.contains(&server.name);
+            if !overwrite {
+                skipped += 1;
+                skipped_details.push((server.name.clone(), "Server already exists".to_string()));
+            } else {
+                if server.auth_method == AuthMethod::Password
+                    && !has_stored_password(&server.name)
+                    && !needs_password.contains(&server.name)
+                {
+                    needs_password.push(server.name.clone());
+                }
+                existing_config.servers[idx] = server.clone();
+                if is_pre_existing && overwritten_names.insert(server.name) {
+                    overwritten += 1;
+                }
+            }
+        } else {
+            if server.auth_method == AuthMethod::Password
+                && !has_stored_password(&server.name)
+                && !needs_password.contains(&server.name)
+            {
+                needs_password.push(server.name.clone());
+            }
+            existing_config.servers.push(server);
+            imported += 1;
+        }
+    }
+
+    if let Some(terminal) = backup_config.preferred_terminal {
+        if existing_config.preferred_terminal.is_none() || overwrite {
+            existing_config.preferred_terminal = Some(terminal);
+        }
+    }
+
+    ImportBackupResult {
+        imported,
+        skipped,
+        overwritten,
+        needs_password,
+        skipped_details,
+        warnings,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3469,5 +3702,307 @@ Match host other
             Duration::from_millis(200),
         );
         assert_eq!(status, PingStatus::DnsError);
+    }
+
+    #[test]
+    fn export_and_backup_serialization_round_trip() {
+        let mut server1 = sample_server("srv-key");
+        server1.tags = vec!["prod".to_string(), "web".to_string()];
+        server1.jump_host = Some("bastion".to_string());
+        server1.forwards = vec![Forward::Local {
+            bind_port: 8080,
+            host: "localhost".to_string(),
+            host_port: 80,
+        }];
+        server1.favorite = true;
+        server1.last_used = Some(1700000000);
+
+        let mut server2 = Server::new(
+            "srv-pw".to_string(),
+            "10.0.0.2".to_string(),
+            "admin".to_string(),
+            2222,
+            AuthMethod::Password,
+            None,
+        );
+        server2.tags = vec!["db".to_string()];
+
+        let config = Config {
+            servers: vec![server1, server2],
+            preferred_terminal: Some("alacritty".to_string()),
+        };
+
+        // Export to pretty JSON
+        let json = serde_json::to_string_pretty(&config).expect("serialization succeeds");
+
+        // Passwords must NEVER be present in the serialized output
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("password_hash"));
+
+        // Round-trip parse back via Storage parsing path
+        let loaded = Storage::parse_servers_file(&json).expect("deserialization succeeds");
+        assert_eq!(loaded.servers.len(), 2);
+        assert_eq!(loaded.servers[0].name, "srv-key");
+        assert_eq!(loaded.servers[0].tags, vec!["prod", "web"]);
+        assert_eq!(loaded.servers[0].jump_host.as_deref(), Some("bastion"));
+        assert_eq!(loaded.servers[0].forwards.len(), 1);
+        assert!(loaded.servers[0].favorite);
+        assert_eq!(loaded.servers[0].last_used, Some(1700000000));
+
+        assert_eq!(loaded.servers[1].name, "srv-pw");
+        assert_eq!(loaded.servers[1].auth_method, AuthMethod::Password);
+        assert_eq!(loaded.servers[1].tags, vec!["db"]);
+        assert_eq!(loaded.preferred_terminal.as_deref(), Some("alacritty"));
+    }
+
+    #[test]
+    fn export_and_backup_legacy_bare_array_format_parse() {
+        let legacy_json = r#"[
+            {
+                "name": "legacy-srv",
+                "host": "192.168.1.10",
+                "username": "ubuntu",
+                "port": 22,
+                "auth_method": "key",
+                "use_agent_forwarding": true
+            }
+        ]"#;
+
+        let parsed = Storage::parse_servers_file(legacy_json).expect("legacy array parsed");
+        assert_eq!(parsed.servers.len(), 1);
+        assert_eq!(parsed.servers[0].name, "legacy-srv");
+        assert_eq!(parsed.servers[0].host, "192.168.1.10");
+        assert_eq!(parsed.servers[0].username, "ubuntu");
+        assert!(parsed.servers[0].use_agent_forwarding);
+        assert!(parsed.servers[0].tags.is_empty());
+        assert!(parsed.preferred_terminal.is_none());
+
+        // Import backup also handles this legacy format
+        let mut existing = Config::new();
+        let res = import_backup_servers(&mut existing, parsed, false, |_| true, |_| false);
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.skipped, 0);
+        assert_eq!(res.overwritten, 0);
+        assert_eq!(existing.servers.len(), 1);
+        assert_eq!(existing.servers[0].name, "legacy-srv");
+    }
+
+    #[test]
+    fn export_and_backup_collision_and_overwrite_logic() {
+        let s1 = sample_server("server-a");
+        let mut s2 = sample_server("server-b");
+        s2.host = "old.host.com".to_string();
+
+        let base_config = Config {
+            servers: vec![s1, s2],
+            preferred_terminal: Some("xterm".to_string()),
+        };
+
+        // Backup containing an updated server-b and a new server-c
+        let mut s2_updated = sample_server("server-b");
+        s2_updated.host = "new.host.com".to_string();
+        let s3 = sample_server("server-c");
+
+        let backup = Config {
+            servers: vec![s2_updated, s3],
+            preferred_terminal: Some("kitty".to_string()),
+        };
+
+        // Case 1: overwrite = false -> server-b skipped, server-c imported
+        {
+            let mut cfg = base_config.clone();
+            let res = import_backup_servers(&mut cfg, backup.clone(), false, |_| true, |_| false);
+            assert_eq!(res.imported, 1);
+            assert_eq!(res.skipped, 1);
+            assert_eq!(res.overwritten, 0);
+            assert_eq!(cfg.servers.len(), 3);
+            assert_eq!(cfg.servers[1].name, "server-b");
+            assert_eq!(cfg.servers[1].host, "old.host.com"); // Not overwritten
+            assert_eq!(cfg.servers[2].name, "server-c");
+            assert_eq!(cfg.preferred_terminal.as_deref(), Some("xterm")); // Not overwritten
+        }
+
+        // Case 2: overwrite = true -> server-b overwritten in-place, server-c imported
+        {
+            let mut cfg = base_config;
+            let res = import_backup_servers(&mut cfg, backup, true, |_| true, |_| false);
+            assert_eq!(res.imported, 1);
+            assert_eq!(res.skipped, 0);
+            assert_eq!(res.overwritten, 1);
+            assert_eq!(cfg.servers.len(), 3);
+            assert_eq!(cfg.servers[1].name, "server-b");
+            assert_eq!(cfg.servers[1].host, "new.host.com"); // Overwritten!
+            assert_eq!(cfg.servers[2].name, "server-c");
+            assert_eq!(cfg.preferred_terminal.as_deref(), Some("kitty")); // Overwritten!
+        }
+    }
+
+    #[test]
+    fn export_and_backup_summary_building() {
+        let result = ImportBackupResult {
+            imported: 3,
+            skipped: 1,
+            overwritten: 2,
+            needs_password: vec!["web-auth".to_string(), "db-auth".to_string()],
+            skipped_details: vec![(
+                "colliding-srv".to_string(),
+                "Server already exists".to_string(),
+            )],
+            warnings: vec!["Server 'web': key file not found".to_string()],
+        };
+
+        let summary = result.summary_text();
+        assert!(summary.contains("imported 3, skipped 1, overwritten 2"));
+        assert!(summary.contains("needs password:"));
+        assert!(summary.contains("  - web-auth: needs password: ssher edit web-auth --password"));
+        assert!(summary.contains("  - db-auth: needs password: ssher edit db-auth --password"));
+        assert!(summary.contains("Skipped servers:"));
+        assert!(summary.contains("  - colliding-srv: Server already exists"));
+        assert!(summary.contains("Warnings:"));
+        assert!(summary.contains("  - Server 'web': key file not found"));
+
+        // Minimal clean result
+        let clean = ImportBackupResult {
+            imported: 1,
+            skipped: 0,
+            overwritten: 0,
+            needs_password: vec![],
+            skipped_details: vec![],
+            warnings: vec![],
+        };
+        assert_eq!(clean.summary_text(), "imported 1, skipped 0, overwritten 0");
+    }
+
+    #[test]
+    fn export_and_backup_tag_filter() {
+        let mut s1 = sample_server("s1");
+        s1.tags = vec!["prod".to_string(), "web".to_string()];
+        let mut s2 = sample_server("s2");
+        s2.tags = vec!["prod".to_string(), "db".to_string()];
+        let mut s3 = sample_server("s3");
+        s3.tags = vec!["staging".to_string(), "web".to_string()];
+        let mut s4 = sample_server("s4");
+        s4.tags = vec![];
+        let servers = vec![s1, s2, s3, s4];
+
+        // Empty tags returns all
+        let all = filter_servers_by_tags(&servers, &[]).unwrap();
+        assert_eq!(all.len(), 4);
+
+        // Single tag "prod"
+        let prod = filter_servers_by_tags(&servers, &[String::from("prod")]).unwrap();
+        assert_eq!(prod.len(), 2);
+        assert_eq!(prod[0].name, "s1");
+        assert_eq!(prod[1].name, "s2");
+
+        // Multiple tags "prod" AND "web"
+        let prod_web =
+            filter_servers_by_tags(&servers, &[String::from("prod"), String::from("web")]).unwrap();
+        assert_eq!(prod_web.len(), 1);
+        assert_eq!(prod_web[0].name, "s1");
+
+        // Case insensitivity
+        let upper = filter_servers_by_tags(&servers, &[String::from("PROD")]).unwrap();
+        assert_eq!(upper.len(), 2);
+
+        // Non-matching tag returns empty vec
+        let none = filter_servers_by_tags(&servers, &[String::from("unknown")]).unwrap();
+        assert!(none.is_empty());
+
+        // Invalid tag returns error
+        let err = filter_servers_by_tags(&servers, &[String::from("bad tag!")]).unwrap_err();
+        assert!(matches!(err, SshManagerError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn export_and_backup_key_file_warning_keeps_server() {
+        let mut server = sample_server("missing-key-srv");
+        server.auth_method = AuthMethod::Key;
+        server.key_path = Some("/path/does/not/exist".to_string());
+
+        let backup = Config {
+            servers: vec![server],
+            preferred_terminal: None,
+        };
+
+        let mut config = Config::new();
+        let res = import_backup_servers(&mut config, backup, false, |_| false, |_| false);
+
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.skipped, 0);
+        assert_eq!(res.warnings.len(), 1);
+        assert!(res.warnings[0].contains("SSH key file not found"));
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name, "missing-key-srv");
+    }
+
+    #[test]
+    fn export_and_backup_invalid_server_skipped() {
+        let mut bad_port = sample_server("bad-port");
+        bad_port.port = 0;
+
+        let mut bad_name = sample_server("bad name!");
+        bad_name.name = "bad name!".to_string();
+
+        let backup = Config {
+            servers: vec![bad_port, bad_name],
+            preferred_terminal: None,
+        };
+
+        let mut config = Config::new();
+        let res = import_backup_servers(&mut config, backup, false, |_| true, |_| false);
+
+        assert_eq!(res.imported, 0);
+        assert_eq!(res.skipped, 2);
+        assert_eq!(res.skipped_details.len(), 2);
+        assert!(res.skipped_details[0].1.contains("Invalid port"));
+        assert!(res.skipped_details[1].1.contains("Invalid server name"));
+        assert!(config.servers.is_empty());
+    }
+
+    #[test]
+    fn export_and_backup_password_reporting() {
+        let pw_server = Server::new(
+            "pw-node".to_string(),
+            "10.0.0.5".to_string(),
+            "user".to_string(),
+            22,
+            AuthMethod::Password,
+            None,
+        );
+
+        let backup = Config {
+            servers: vec![pw_server],
+            preferred_terminal: None,
+        };
+
+        // When imported without stored password, it is reported in needs_password
+        let mut config = Config::new();
+        let res = import_backup_servers(&mut config, backup.clone(), false, |_| true, |_| false);
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.needs_password, vec!["pw-node"]);
+        assert!(res.summary_text().contains("ssher edit pw-node --password"));
+
+        // When overwritten and existing server already had password in keyring, not reported
+        let mut config_with_existing = Config {
+            servers: vec![Server::new(
+                "pw-node".to_string(),
+                "10.0.0.5".to_string(),
+                "user".to_string(),
+                22,
+                AuthMethod::Password,
+                None,
+            )],
+            preferred_terminal: None,
+        };
+        let res2 = import_backup_servers(
+            &mut config_with_existing,
+            backup,
+            true,
+            |_| true,
+            |name| name == "pw-node",
+        );
+        assert_eq!(res2.overwritten, 1);
+        assert!(res2.needs_password.is_empty());
     }
 }
