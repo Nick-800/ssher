@@ -799,6 +799,60 @@ pub fn switch_server_to_key(server: &mut Server, pub_path: &str) -> Result<Strin
     Ok(priv_path.to_string())
 }
 
+/// Expand leading `~` or `~/` to the user's home directory.
+pub fn expand_tilde_path(p: &std::path::Path) -> Result<std::path::PathBuf> {
+    let s = p.to_string_lossy();
+    if s == "~" {
+        dirs::home_dir().ok_or_else(|| {
+            SshManagerError::ConfigDirError(
+                "Could not determine home directory. $HOME not set?".to_string(),
+            )
+        })
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            SshManagerError::ConfigDirError(
+                "Could not determine home directory. $HOME not set?".to_string(),
+            )
+        })?;
+        Ok(home.join(rest))
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
+/// Split transfer paths into source paths and destination path.
+/// Requires at least one source and a non-empty destination.
+pub fn split_transfer_paths(paths: &[String]) -> Result<(&[String], &str)> {
+    if paths.len() < 2 {
+        return Err(SshManagerError::MissingSourceOrDestination);
+    }
+    let (sources, dest) = paths.split_at(paths.len() - 1);
+    let dest_str = dest[0].trim();
+    if dest_str.is_empty() {
+        return Err(SshManagerError::MissingSourceOrDestination);
+    }
+    Ok((sources, dest[0].as_str()))
+}
+
+/// Validate that every local source exists on disk.
+pub fn validate_local_sources(sources: &[String]) -> Result<()> {
+    if sources.is_empty() {
+        return Err(SshManagerError::MissingSourceOrDestination);
+    }
+    for src in sources {
+        let p = std::path::Path::new(src);
+        let exists = if let Ok(expanded) = expand_tilde_path(p) {
+            expanded.exists()
+        } else {
+            p.exists()
+        };
+        if !exists {
+            return Err(SshManagerError::LocalSourceNotFound(src.clone()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalConfig {
     pub terminal: String,
@@ -2876,5 +2930,74 @@ Match host other
             server.key_path,
             Some("/home/bob/.ssh/id_ed25519".to_string())
         );
+    }
+
+    #[test]
+    fn split_transfer_paths_single_source() {
+        let paths = vec!["local.txt".to_string(), "/remote/dir".to_string()];
+        let (sources, dest) = split_transfer_paths(&paths).unwrap();
+        assert_eq!(sources, &["local.txt"]);
+        assert_eq!(dest, "/remote/dir");
+    }
+
+    #[test]
+    fn split_transfer_paths_multiple_sources() {
+        let paths = vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "/remote/dir".to_string(),
+        ];
+        let (sources, dest) = split_transfer_paths(&paths).unwrap();
+        assert_eq!(sources, &["a.txt", "b.txt"]);
+        assert_eq!(dest, "/remote/dir");
+    }
+
+    #[test]
+    fn split_transfer_paths_too_few_args_errors() {
+        let empty: Vec<String> = Vec::new();
+        assert!(matches!(
+            split_transfer_paths(&empty).unwrap_err(),
+            SshManagerError::MissingSourceOrDestination
+        ));
+
+        let single = vec!["only_one".to_string()];
+        assert!(matches!(
+            split_transfer_paths(&single).unwrap_err(),
+            SshManagerError::MissingSourceOrDestination
+        ));
+    }
+
+    #[test]
+    fn split_transfer_paths_empty_destination_errors() {
+        let paths = vec!["file.txt".to_string(), "   ".to_string()];
+        assert!(matches!(
+            split_transfer_paths(&paths).unwrap_err(),
+            SshManagerError::MissingSourceOrDestination
+        ));
+    }
+
+    #[test]
+    fn validate_local_sources_succeeds_for_existing_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let sources = vec![
+            file_path.to_string_lossy().into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+        ];
+        assert!(validate_local_sources(&sources).is_ok());
+    }
+
+    #[test]
+    fn validate_local_sources_errors_for_missing_file() {
+        let missing = vec!["/nonexistent/path/to/file_ssher_test.txt".to_string()];
+        let err = validate_local_sources(&missing).unwrap_err();
+        match err {
+            SshManagerError::LocalSourceNotFound(p) => {
+                assert_eq!(p, "/nonexistent/path/to/file_ssher_test.txt");
+            }
+            _ => panic!("expected LocalSourceNotFound"),
+        }
     }
 }

@@ -17,6 +17,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - **Shell Completions**: Native completions for Bash, Zsh, Fish, Elvish, and PowerShell, with dynamic server-name and jump host completion
 - **Remote Command Execution**: Run one-off remote commands inline (`ssher exec`) on single servers, tag sets, or all servers with sequential execution and BatchMode protection
 - **Public Key Installation**: Install public SSH keys on saved servers (`ssher copy-id`), with jump host support, `SSH_ASKPASS` password delivery, and optional switching to key authentication (`--switch-to-key`)
+- **File Transfer (SCP)**: Upload and download files or directories (`ssher put` and `ssher get`) wrapping `scp` with recursive transfer (`-r`), jump host support, `SSH_ASKPASS` password delivery, and automatic IPv6 formatting
 - **JSON Configuration**: Server configs stored in `~/.config/ssh_manager/servers.json`
 
 ## Requirements
@@ -25,7 +26,7 @@ A Linux CLI application to manage and launch SSH connections to saved servers. S
 - Linux operating system
 - Rust 1.70+ (for building)
 - One of the following terminal emulators: `gnome-terminal`, `konsole`, `xfce4-terminal`, or `xterm`
-- `openssh-client` (providing `ssh` and `ssh-copy-id`, usually pre-installed on most Linux distributions)
+- `openssh-client` (providing `ssh`, `scp`, and `ssh-copy-id`, usually pre-installed on most Linux distributions)
 
 ## Installation
 
@@ -237,6 +238,41 @@ ssher copy-id password-server --key ~/.ssh/id_ed25519 --switch-to-key
 - Jump hosts: if the server is configured with a jump host, `-o ProxyJump=...` is automatically passed with the fully resolved jump chain.
 - Password authentication: for password servers, `ssher` supplies the stored password securely using the `SSH_ASKPASS` helper (the password never appears on a command line or in the process table).
 - `--switch-to-key`: upon successful exit of `ssh-copy-id` on a password-authenticated server, updates the server configuration to Key authentication with the private key path (`pub path minus ".pub"`), saves the configuration, and removes the password from the OS keyring.
+
+### File Transfer (put / get)
+
+Upload or download files and directories wrapping `scp`:
+
+```bash
+# Upload a local file to a remote directory
+ssher put myserver ./app.tar.gz /var/www/
+
+# Upload multiple local files to a remote directory
+ssher put myserver file1.txt file2.txt /tmp/
+
+# Upload a directory recursively
+ssher put -r myserver ./dist /var/www/html/
+
+# Download a remote file to a local directory
+ssher get myserver /var/log/nginx/access.log ./logs/
+
+# Download multiple remote files to a local directory
+ssher get myserver /etc/hosts /etc/resolv.conf ./backup/
+
+# Download a directory recursively
+ssher get -r myserver /var/www/uploads ./downloads/
+```
+
+#### Behavior & Options:
+- `<name>`: Saved server name (supports exact match or unique partial-name resolution).
+- `-r`, `--recursive`: Copy entire directories recursively (passes `-r` to `scp`).
+- `ssher put <name> <local>... <remote_dir>`: Uploads one or more local files/directories to the remote directory. Validates that each local source exists before launching `scp`.
+- `ssher get <name> <remote>... <local_dir>`: Downloads one or more remote files/directories to the local destination directory.
+- Jump hosts: If the server is configured with a jump host (`--jump`), `-J <resolved>` is automatically passed with the fully resolved jump chain.
+- Custom ports: If the server uses a non-default port, `-P <port>` is passed to `scp`.
+- IPv6 hosts: IPv6 addresses are automatically enclosed in brackets (`user@[ipv6]:path`).
+- Safe path handling: Local paths starting with `-` are protected with `./` prefixing and passed after `--` to prevent flag injection.
+- Password authentication: Securely reuses the temporary `SSH_ASKPASS` helper. Passwords are read from the OS keyring and never appear on the command line or in the process table.
 
 ### Edit a Server
 
@@ -556,6 +592,9 @@ The application provides clear error messages for common issues:
 - `Jump host cycle detected: ...` — Jump host chains cannot form a cycle
 - `Jump host chain exceeds maximum depth of 5 hops` — Jump chains cannot exceed 5 hops
 - `Invalid port forwarding specification: ...` — Forward specification is malformed or port is outside 1-65535
+- `scp is not installed. Please install OpenSSH client tools` — `scp` was not found in PATH
+- `Local source file not found: ...` — Local file or directory specified for upload does not exist
+- `At least one source and a destination must be specified` — Missing source or destination argument
 
 ## Command Reference
 
@@ -613,6 +652,14 @@ ssher copy-id <name> [OPTIONS]
   --pub <path>                  Public key file path (e.g. ~/.ssh/id_ed25519.pub)
   --key <path>                  Private or public key file path (e.g. ~/.ssh/id_ed25519)
   --switch-to-key               Switch server to key authentication upon success
+
+# Upload files/directories to server (wrapping scp)
+ssher put <name> <local>... <remote_dir> [OPTIONS]
+  -r, --recursive               Copy directories recursively
+
+# Download files/directories from server (wrapping scp)
+ssher get <name> <remote>... <local_dir> [OPTIONS]
+  -r, --recursive               Copy directories recursively
 
 # Remove a server
 ssher remove <name>

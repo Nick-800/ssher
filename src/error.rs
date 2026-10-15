@@ -67,6 +67,15 @@ pub enum SshManagerError {
     #[error("ssh-copy-id is not installed. Please install OpenSSH client tools")]
     SshCopyIdNotFound,
 
+    #[error("scp is not installed. Please install OpenSSH client tools")]
+    ScpNotFound,
+
+    #[error("Local source file not found: {0}")]
+    LocalSourceNotFound(String),
+
+    #[error("At least one source and a destination must be specified")]
+    MissingSourceOrDestination,
+
     #[error("Failed to set up SSH_ASKPASS helper: {0}")]
     AskspassSetupFailed(String),
 

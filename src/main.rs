@@ -173,6 +173,34 @@ enum Commands {
         switch_to_key: bool,
     },
 
+    /// Upload files or directories to a remote server using scp
+    Put {
+        /// Server name to upload files to
+        name: String,
+
+        /// Copy directories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
+        /// Local source paths followed by remote destination directory
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+    },
+
+    /// Download files or directories from a remote server using scp
+    Get {
+        /// Server name to download files from
+        name: String,
+
+        /// Copy directories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
+        /// Remote source paths followed by local destination directory
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+    },
+
     /// Remove a saved SSH server
     Remove {
         /// Server name to remove
@@ -351,6 +379,16 @@ fn run(cli: Cli) -> Result<()> {
                 switch_to_key,
             },
         ),
+        Commands::Put {
+            name,
+            recursive,
+            paths,
+        } => put_files(&name, recursive, &paths),
+        Commands::Get {
+            name,
+            recursive,
+            paths,
+        } => get_files(&name, recursive, &paths),
         Commands::Remove { name } => remove_server(&name),
         Commands::Fav { name } => set_favorite(&name, true),
         Commands::Unfav { name } => set_favorite(&name, false),
@@ -818,6 +856,71 @@ fn copy_id_server(name: &str, args: CopyIdArgs) -> Result<()> {
     Ok(())
 }
 
+fn put_files(name: &str, recursive: bool, paths: &[String]) -> Result<()> {
+    let (sources, dest) = models::split_transfer_paths(paths)?;
+    models::validate_local_sources(sources)?;
+
+    let config = Storage::load_config()?;
+    let server = config.resolve_server(name)?;
+    let server_name = server.name.clone();
+    let jump = models::resolve_jump(&config, server)?;
+
+    let status = Ssh::execute_put(server, jump.as_deref(), recursive, sources, dest)?;
+
+    if let Err(e) = Storage::record_server_launch(&server_name) {
+        eprintln!("Warning: failed to save last used timestamp: {}", e);
+    }
+
+    if !status.success() {
+        let code = status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map(|s| 128 + s).unwrap_or(1)
+            }
+            #[cfg(not(unix))]
+            {
+                1
+            }
+        });
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
+fn get_files(name: &str, recursive: bool, paths: &[String]) -> Result<()> {
+    let (sources, dest) = models::split_transfer_paths(paths)?;
+
+    let config = Storage::load_config()?;
+    let server = config.resolve_server(name)?;
+    let server_name = server.name.clone();
+    let jump = models::resolve_jump(&config, server)?;
+
+    let status = Ssh::execute_get(server, jump.as_deref(), recursive, sources, dest)?;
+
+    if let Err(e) = Storage::record_server_launch(&server_name) {
+        eprintln!("Warning: failed to save last used timestamp: {}", e);
+    }
+
+    if !status.success() {
+        let code = status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map(|s| 128 + s).unwrap_or(1)
+            }
+            #[cfg(not(unix))]
+            {
+                1
+            }
+        });
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
 fn remove_server(name: &str) -> Result<()> {
     let mut config = Storage::load_config()?;
 
@@ -860,23 +963,7 @@ struct ImportArgs {
 }
 
 fn expand_tilde_path(p: &std::path::Path) -> Result<std::path::PathBuf> {
-    let s = p.to_string_lossy();
-    if s == "~" {
-        dirs::home_dir().ok_or_else(|| {
-            error::SshManagerError::ConfigDirError(
-                "Could not determine home directory. $HOME not set?".to_string(),
-            )
-        })
-    } else if let Some(rest) = s.strip_prefix("~/") {
-        let home = dirs::home_dir().ok_or_else(|| {
-            error::SshManagerError::ConfigDirError(
-                "Could not determine home directory. $HOME not set?".to_string(),
-            )
-        })?;
-        Ok(home.join(rest))
-    } else {
-        Ok(p.to_path_buf())
-    }
+    models::expand_tilde_path(p)
 }
 
 fn import_servers(args: ImportArgs) -> Result<()> {
@@ -1017,10 +1104,12 @@ _ssher_complete() {
     esac
 
     local subcmd=""
+    local subcmd_idx=0
     for (( i=1; i < COMP_CWORD; i++ )); do
         case "${COMP_WORDS[i]}" in
-            connect|edit|remove|fav|unfav|exec|copy-id)
+            connect|edit|remove|fav|unfav|exec|copy-id|put|get)
                 subcmd="${COMP_WORDS[i]}"
+                subcmd_idx=$i
                 break
                 ;;
             add|list|import|completions|config|help)
@@ -1030,11 +1119,19 @@ _ssher_complete() {
     done
 
     if [[ -n "${subcmd}" && "${cur}" != -* ]]; then
-        local servers
-        servers="$(ssher __complete-servers 2>/dev/null)"
-        if [[ -n "${servers}" ]]; then
-            COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
-            return 0
+        local pos_count=0
+        for (( i=subcmd_idx+1; i < COMP_CWORD; i++ )); do
+            if [[ "${COMP_WORDS[i]}" != -* ]]; then
+                ((pos_count++))
+            fi
+        done
+        if [[ "${subcmd}" != "put" && "${subcmd}" != "get" ]] || [[ $pos_count -eq 0 ]]; then
+            local servers
+            servers="$(ssher __complete-servers 2>/dev/null)"
+            if [[ -n "${servers}" ]]; then
+                COMPREPLY=( $(compgen -W "${servers}" -- "${cur}") )
+                return 0
+            fi
         fi
     fi
 
@@ -1051,8 +1148,8 @@ fi
         }
         clap_complete::Shell::Fish => {
             let fish_snippet = r#"
-# Dynamic server completion for connect, edit, remove, fav, unfav, exec, copy-id
-complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec copy-id" -f -a "(ssher __complete-servers)"
+# Dynamic server completion for connect, edit, remove, fav, unfav, exec, copy-id, put, get
+complete -c ssher -n "__fish_ssher_using_subcommand connect edit remove fav unfav exec copy-id put get" -f -a "(ssher __complete-servers)"
 complete -c ssher -l tag -f -a "(ssher __complete-tags)"
 complete -c ssher -l jump -f -a "(ssher __complete-servers)"
 complete -c ssher -l sort -f -a "recent name"
@@ -1084,6 +1181,14 @@ complete -c ssher -l sort -f -a "recent name"
                 .replace(
                     ":name -- Server name to copy SSH key to:_default",
                     ":name -- Server name to copy SSH key to:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to upload files to:_default",
+                    ":name -- Server name to upload files to:_ssher_servers",
+                )
+                .replace(
+                    ":name -- Server name to download files from:_default",
+                    ":name -- Server name to download files from:_ssher_servers",
                 )
                 .replace(":JUMP:_default", ":JUMP:_ssher_servers")
                 .replace(
@@ -1578,7 +1683,7 @@ mod tests {
         assert!(bash.contains("--jump"));
         assert!(bash.contains("--forward"));
         assert!(bash.contains("--sort"));
-        assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id"));
+        assert!(bash.contains("connect|edit|remove|fav|unfav|exec|copy-id|put|get"));
 
         let zsh = generate_completion_script(clap_complete::Shell::Zsh);
         assert!(zsh.contains("__complete-servers"));
@@ -1589,12 +1694,14 @@ mod tests {
         assert!(zsh.contains(":name -- Server name to favorite:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to unfavorite:_ssher_servers"));
         assert!(zsh.contains(":name -- Server name to copy SSH key to:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to upload files to:_ssher_servers"));
+        assert!(zsh.contains(":name -- Server name to download files from:_ssher_servers"));
 
         let fish = generate_completion_script(clap_complete::Shell::Fish);
         assert!(fish.contains("__complete-servers"));
         assert!(fish.contains("__complete-tags"));
         assert!(fish.contains("__fish_ssher_using_subcommand"));
-        assert!(fish.contains("connect edit remove fav unfav exec copy-id"));
+        assert!(fish.contains("connect edit remove fav unfav exec copy-id put get"));
         assert!(fish.contains("-l jump"));
         assert!(fish.contains("-l sort"));
     }
@@ -1904,5 +2011,98 @@ mod tests {
     #[test]
     fn cli_parse_copy_id_missing_name_errors() {
         assert!(Cli::try_parse_from(["ssher", "copy-id"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_put_defaults() {
+        let cli =
+            Cli::try_parse_from(["ssher", "put", "myserver", "file1.txt", "/remote/dir"]).unwrap();
+        match cli.command {
+            Commands::Put {
+                name,
+                recursive,
+                paths,
+            } => {
+                assert_eq!(name, "myserver");
+                assert!(!recursive);
+                assert_eq!(paths, vec!["file1.txt", "/remote/dir"]);
+            }
+            _ => panic!("expected Commands::Put"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_put_recursive() {
+        let cli = Cli::try_parse_from(["ssher", "put", "-r", "myserver", "./dir", "/remote/dir"])
+            .unwrap();
+        match cli.command {
+            Commands::Put {
+                name,
+                recursive,
+                paths,
+            } => {
+                assert_eq!(name, "myserver");
+                assert!(recursive);
+                assert_eq!(paths, vec!["./dir", "/remote/dir"]);
+            }
+            _ => panic!("expected Commands::Put"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_get_defaults() {
+        let cli =
+            Cli::try_parse_from(["ssher", "get", "myserver", "/remote/file.txt", "."]).unwrap();
+        match cli.command {
+            Commands::Get {
+                name,
+                recursive,
+                paths,
+            } => {
+                assert_eq!(name, "myserver");
+                assert!(!recursive);
+                assert_eq!(paths, vec!["/remote/file.txt", "."]);
+            }
+            _ => panic!("expected Commands::Get"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_get_recursive() {
+        let cli = Cli::try_parse_from([
+            "ssher",
+            "get",
+            "--recursive",
+            "myserver",
+            "/remote/dir",
+            "./local",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Get {
+                name,
+                recursive,
+                paths,
+            } => {
+                assert_eq!(name, "myserver");
+                assert!(recursive);
+                assert_eq!(paths, vec!["/remote/dir", "./local"]);
+            }
+            _ => panic!("expected Commands::Get"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_put_missing_args_errors() {
+        assert!(Cli::try_parse_from(["ssher", "put", "myserver"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "put", "myserver", "only_one"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "put"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_get_missing_args_errors() {
+        assert!(Cli::try_parse_from(["ssher", "get", "myserver"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "get", "myserver", "only_one"]).is_err());
+        assert!(Cli::try_parse_from(["ssher", "get"]).is_err());
     }
 }

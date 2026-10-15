@@ -390,6 +390,228 @@ impl Ssh {
 
         Ok(status)
     }
+
+    /// Format a remote target path for scp (`user@host:path`), bracketing IPv6 hosts.
+    pub fn format_remote_target(username: &str, host: &str, path: &str) -> String {
+        let bracketed_host =
+            if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+                format!("[{}]", host)
+            } else {
+                host.to_string()
+            };
+        format!("{}@{}:{}", username, bracketed_host, path)
+    }
+
+    /// Protect a local path that starts with `-` by prefixing with `./`.
+    pub fn protect_local_path(path: &str) -> String {
+        if path.starts_with('-') && !path.starts_with("./") {
+            format!("./{}", path)
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// Build the argv for `scp` upload (put), NOT including `scp` as argv[0].
+    pub fn build_put_args<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        local_sources: &[S],
+        remote_dest: &str,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+
+        if recursive {
+            args.push("-r".to_string());
+        }
+
+        if server.port != 22 {
+            args.push("-P".to_string());
+            args.push(server.port.to_string());
+        }
+
+        if let Some(key_path) = &server.key_path {
+            args.push("-i".to_string());
+            args.push(key_path.clone());
+        }
+
+        if let Some(jump_spec) = jump {
+            args.push("-J".to_string());
+            args.push(jump_spec.to_string());
+        }
+
+        args.push("--".to_string());
+
+        for src in local_sources {
+            args.push(Self::protect_local_path(src.as_ref()));
+        }
+
+        args.push(Self::format_remote_target(
+            &server.username,
+            &server.host,
+            remote_dest,
+        ));
+
+        args
+    }
+
+    /// Build the full argv for spawning `scp` upload (put), with `"scp"` as argv[0].
+    pub fn build_put_argv<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        local_sources: &[S],
+        remote_dest: &str,
+    ) -> Vec<String> {
+        let mut argv = vec!["scp".to_string()];
+        argv.extend(Self::build_put_args(
+            server,
+            jump,
+            recursive,
+            local_sources,
+            remote_dest,
+        ));
+        argv
+    }
+
+    /// Build the argv for `scp` download (get), NOT including `scp` as argv[0].
+    pub fn build_get_args<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        remote_sources: &[S],
+        local_dest: &str,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+
+        if recursive {
+            args.push("-r".to_string());
+        }
+
+        if server.port != 22 {
+            args.push("-P".to_string());
+            args.push(server.port.to_string());
+        }
+
+        if let Some(key_path) = &server.key_path {
+            args.push("-i".to_string());
+            args.push(key_path.clone());
+        }
+
+        if let Some(jump_spec) = jump {
+            args.push("-J".to_string());
+            args.push(jump_spec.to_string());
+        }
+
+        args.push("--".to_string());
+
+        for src in remote_sources {
+            args.push(Self::format_remote_target(
+                &server.username,
+                &server.host,
+                src.as_ref(),
+            ));
+        }
+
+        args.push(Self::protect_local_path(local_dest));
+
+        args
+    }
+
+    /// Build the full argv for spawning `scp` download (get), with `"scp"` as argv[0].
+    pub fn build_get_argv<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        remote_sources: &[S],
+        local_dest: &str,
+    ) -> Vec<String> {
+        let mut argv = vec!["scp".to_string()];
+        argv.extend(Self::build_get_args(
+            server,
+            jump,
+            recursive,
+            remote_sources,
+            local_dest,
+        ));
+        argv
+    }
+
+    /// Check if `scp` is installed on PATH.
+    pub fn scp_exists() -> bool {
+        crate::terminal::Terminal::command_exists("scp")
+    }
+
+    /// Execute `scp` in the current terminal with inherited stdio.
+    /// Password authentication reuses the temporary SSH_ASKPASS helper.
+    pub fn execute_scp(server: &Server, argv: &[String]) -> Result<std::process::ExitStatus> {
+        if !Self::scp_exists() {
+            return Err(SshManagerError::ScpNotFound);
+        }
+
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut askpass_dir: Option<PathBuf> = None;
+
+        if let Ok(current_term) = env::var("TERM") {
+            if let Some(normalized) = Self::normalize_term(&current_term) {
+                env.push(("TERM".to_string(), normalized.to_string()));
+            }
+        }
+
+        if server.auth_method == AuthMethod::Password {
+            let password = Self::get_password(&server.name)?;
+            let dir = setup_askpass(&password)?;
+            let script = dir.join("askpass.sh");
+            env.push((
+                "SSH_ASKPASS".to_string(),
+                script.to_string_lossy().into_owned(),
+            ));
+            env.push(("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()));
+            askpass_dir = Some(dir);
+        }
+
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+
+        let status_res = cmd.status();
+
+        if let Some(dir) = askpass_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        let status = status_res.map_err(|e| {
+            SshManagerError::SshLaunchFailed(format!("Failed to execute {}: {}", argv[0], e))
+        })?;
+
+        Ok(status)
+    }
+
+    /// Execute `scp` put in the current terminal with inherited stdio.
+    pub fn execute_put<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        local_sources: &[S],
+        remote_dest: &str,
+    ) -> Result<std::process::ExitStatus> {
+        let argv = Self::build_put_argv(server, jump, recursive, local_sources, remote_dest);
+        Self::execute_scp(server, &argv)
+    }
+
+    /// Execute `scp` get in the current terminal with inherited stdio.
+    pub fn execute_get<S: AsRef<str>>(
+        server: &Server,
+        jump: Option<&str>,
+        recursive: bool,
+        remote_sources: &[S],
+        local_dest: &str,
+    ) -> Result<std::process::ExitStatus> {
+        let argv = Self::build_get_argv(server, jump, recursive, remote_sources, local_dest);
+        Self::execute_scp(server, &argv)
+    }
 }
 
 /// Set up a temporary directory containing a shell helper script and a
@@ -798,5 +1020,380 @@ mod tests {
         let joined = args.join("\n");
         assert!(!joined.contains("password"));
         assert!(!joined.contains("hunter2"));
+    }
+
+    #[test]
+    fn format_remote_target_standard_host() {
+        assert_eq!(
+            Ssh::format_remote_target("alice", "example.com", "/var/www"),
+            "alice@example.com:/var/www"
+        );
+        assert_eq!(
+            Ssh::format_remote_target("bob", "192.168.1.10", "file.txt"),
+            "bob@192.168.1.10:file.txt"
+        );
+    }
+
+    #[test]
+    fn format_remote_target_ipv6_host_brackets() {
+        assert_eq!(
+            Ssh::format_remote_target("alice", "2001:db8::1", "/data"),
+            "alice@[2001:db8::1]:/data"
+        );
+        assert_eq!(
+            Ssh::format_remote_target("alice", "::1", "file.txt"),
+            "alice@[::1]:file.txt"
+        );
+        assert_eq!(
+            Ssh::format_remote_target("alice", "[2001:db8::1]", "/data"),
+            "alice@[2001:db8::1]:/data"
+        );
+    }
+
+    #[test]
+    fn protect_local_path_dash_leading() {
+        assert_eq!(Ssh::protect_local_path("-foo.txt"), "./-foo.txt");
+        assert_eq!(Ssh::protect_local_path("-r"), "./-r");
+        assert_eq!(Ssh::protect_local_path("--"), "./--");
+        assert_eq!(Ssh::protect_local_path("-"), "./-");
+        assert_eq!(Ssh::protect_local_path("./-foo.txt"), "./-foo.txt");
+        assert_eq!(Ssh::protect_local_path("/path/to/-file"), "/path/to/-file");
+        assert_eq!(Ssh::protect_local_path("normal.txt"), "normal.txt");
+    }
+
+    #[test]
+    fn build_put_args_key_server() {
+        let args = Ssh::build_put_args(&key_server(), None, false, &["local.txt"], "/remote/dir");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "local.txt".to_string(),
+                "alice@example.com:/remote/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_key_server() {
+        let args = Ssh::build_get_args(&key_server(), None, false, &["/remote/file.txt"], ".");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@example.com:/remote/file.txt".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_password_server() {
+        let args = Ssh::build_put_args(
+            &password_server(),
+            None,
+            false,
+            &["local.txt"],
+            "/remote/dir",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-P".to_string(),
+                "2222".to_string(),
+                "--".to_string(),
+                "local.txt".to_string(),
+                "bob@example.com:/remote/dir".to_string(),
+            ]
+        );
+        let joined = args.join("\n");
+        assert!(!joined.contains("password"));
+        assert!(!joined.contains("hunter2"));
+    }
+
+    #[test]
+    fn build_get_args_password_server() {
+        let args = Ssh::build_get_args(
+            &password_server(),
+            None,
+            false,
+            &["/remote/file.txt"],
+            "./downloads",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-P".to_string(),
+                "2222".to_string(),
+                "--".to_string(),
+                "bob@example.com:/remote/file.txt".to_string(),
+                "./downloads".to_string(),
+            ]
+        );
+        let joined = args.join("\n");
+        assert!(!joined.contains("password"));
+        assert!(!joined.contains("hunter2"));
+    }
+
+    #[test]
+    fn build_put_args_with_jump_host() {
+        let args = Ssh::build_put_args(
+            &key_server(),
+            Some("bastion.example.com"),
+            false,
+            &["local.txt"],
+            "/remote/dir",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-J".to_string(),
+                "bastion.example.com".to_string(),
+                "--".to_string(),
+                "local.txt".to_string(),
+                "alice@example.com:/remote/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_with_jump_host() {
+        let args = Ssh::build_get_args(
+            &key_server(),
+            Some("bastion.example.com"),
+            false,
+            &["/remote/file.txt"],
+            "local.txt",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "-J".to_string(),
+                "bastion.example.com".to_string(),
+                "--".to_string(),
+                "alice@example.com:/remote/file.txt".to_string(),
+                "local.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_custom_port() {
+        let mut server = key_server();
+        server.port = 8022;
+        let args = Ssh::build_put_args(&server, None, false, &["file.tar.gz"], "/tmp");
+        assert_eq!(
+            args,
+            vec![
+                "-P".to_string(),
+                "8022".to_string(),
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "file.tar.gz".to_string(),
+                "alice@example.com:/tmp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_custom_port() {
+        let mut server = key_server();
+        server.port = 8022;
+        let args = Ssh::build_get_args(&server, None, false, &["/tmp/file.tar.gz"], ".");
+        assert_eq!(
+            args,
+            vec![
+                "-P".to_string(),
+                "8022".to_string(),
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@example.com:/tmp/file.tar.gz".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_recursive() {
+        let args = Ssh::build_put_args(&key_server(), None, true, &["./folder"], "/remote/dir");
+        assert_eq!(
+            args,
+            vec![
+                "-r".to_string(),
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "./folder".to_string(),
+                "alice@example.com:/remote/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_recursive() {
+        let args = Ssh::build_get_args(&key_server(), None, true, &["/remote/dir"], "./dest");
+        assert_eq!(
+            args,
+            vec![
+                "-r".to_string(),
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@example.com:/remote/dir".to_string(),
+                "./dest".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_ipv6_host() {
+        let mut server = key_server();
+        server.host = "2001:db8::cafe".to_string();
+        let args = Ssh::build_put_args(&server, None, false, &["file.txt"], "/opt");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "file.txt".to_string(),
+                "alice@[2001:db8::cafe]:/opt".to_string(),
+            ]
+        );
+
+        server.host = "[2001:db8::cafe]".to_string();
+        let args2 = Ssh::build_put_args(&server, None, false, &["file.txt"], "/opt");
+        assert_eq!(args2.last().unwrap(), "alice@[2001:db8::cafe]:/opt");
+    }
+
+    #[test]
+    fn build_get_args_ipv6_host() {
+        let mut server = key_server();
+        server.host = "::1".to_string();
+        let args = Ssh::build_get_args(&server, None, false, &["/var/log/syslog"], ".");
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@[::1]:/var/log/syslog".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_dash_leading_local_path() {
+        let args = Ssh::build_put_args(
+            &key_server(),
+            None,
+            false,
+            &["-dangerous-file.txt", "normal.txt"],
+            "/remote/dir",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "./-dangerous-file.txt".to_string(),
+                "normal.txt".to_string(),
+                "alice@example.com:/remote/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_dash_leading_local_path() {
+        let args = Ssh::build_get_args(
+            &key_server(),
+            None,
+            false,
+            &["/remote/file.txt"],
+            "-local-dest",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@example.com:/remote/file.txt".to_string(),
+                "./-local-dest".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_args_multiple_sources() {
+        let args = Ssh::build_put_args(
+            &key_server(),
+            None,
+            false,
+            &["src1.txt", "src2.txt", "src3.txt"],
+            "/remote/dest",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "src1.txt".to_string(),
+                "src2.txt".to_string(),
+                "src3.txt".to_string(),
+                "alice@example.com:/remote/dest".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_get_args_multiple_sources() {
+        let args = Ssh::build_get_args(
+            &key_server(),
+            None,
+            false,
+            &["/remote/1", "/remote/2"],
+            "./dest",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-i".to_string(),
+                "/home/alice/.ssh/id_ed25519".to_string(),
+                "--".to_string(),
+                "alice@example.com:/remote/1".to_string(),
+                "alice@example.com:/remote/2".to_string(),
+                "./dest".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_put_argv_starts_with_scp() {
+        let argv = Ssh::build_put_argv(&key_server(), None, false, &["file.txt"], "/tmp");
+        assert_eq!(argv[0], "scp");
+        assert_eq!(argv[1], "-i");
+        assert_eq!(argv.last().unwrap(), "alice@example.com:/tmp");
+    }
+
+    #[test]
+    fn build_get_argv_starts_with_scp() {
+        let argv = Ssh::build_get_argv(&key_server(), None, false, &["/tmp/file.txt"], ".");
+        assert_eq!(argv[0], "scp");
+        assert_eq!(argv[1], "-i");
+        assert_eq!(argv.last().unwrap(), ".");
     }
 }
