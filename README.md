@@ -254,6 +254,7 @@ ssher copy-id password-server --key ~/.ssh/id_ed25519 --switch-to-key
 - Missing key file: if the `.pub` file does not exist, `ssher` exits with a clear error naming the missing path (keys are never generated automatically).
 - Jump hosts: if the server is configured with a jump host, `-o ProxyJump=...` is automatically passed with the fully resolved jump chain.
 - Password authentication: for password servers, `ssher` supplies the stored password securely using the `SSH_ASKPASS` helper (the password never appears on a command line or in the process table).
+- Key-auth servers: `ssh-copy-id` logs in with your ssh-agent or default identities, not the server's saved `key_path`. If the saved key is non-default, load it first with `ssh-add <key>`. (ssher deliberately does not pass the saved key as an `IdentityFile` option: `ssh-copy-id` reuses those options to check whether the new key is already installed, so the saved key would make every new key look like a duplicate and nothing would be copied.)
 - `--switch-to-key`: upon successful exit of `ssh-copy-id` on a password-authenticated server, updates the server configuration to Key authentication with the private key path (`pub path minus ".pub"`), saves the configuration, and removes the password from the OS keyring.
 
 ### File Transfer (put / get)
